@@ -25,12 +25,26 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>   *
  ***************************************************************************/
 
-#pragma once
-
-#if defined(_CHIP_STM32F2) || defined(_CHIP_STM32F4) || defined(_CHIP_STM32F7)
-#include "stm32_eth_desc_f2_f4_f7.h"
-#elif defined(_CHIP_STM32H7)
 #include "stm32_eth_desc_h7.h"
-#else
-#error "No Ethernet DMA descriptor implmentation for the current chip"
-#endif
+
+#include <interfaces/cache.h>
+
+namespace miosix::stm32_eth {
+
+void RxDmaDescriptor::syncToCpu() {
+    miosix::markBufferAfterDmaRead(this, sizeof(RxWritebackDmaDescriptor));
+}
+
+void RxDmaDescriptor::syncToDma() {
+    miosix::markBufferBeforeDmaWrite(this, sizeof(RxReadDmaDescriptor));
+}
+
+void TxDmaDescriptor::syncToCpu() {
+    miosix::markBufferAfterDmaRead(this, sizeof(TxDmaDescriptor));
+}
+
+void TxDmaDescriptor::syncToDma() {
+    miosix::markBufferBeforeDmaWrite(this, sizeof(TxDmaDescriptor));
+}
+
+} // namespace miosix::stm32_eth
