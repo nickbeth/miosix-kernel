@@ -33,33 +33,48 @@
 namespace {
 /**
  * Clock range bit enumeration.
- * Named as range (low, high].
+ * Named as range [low, high).
  */
 enum ClockRange {
-    CR_150_216MHz = 0b100,
-    CR_100_150MHz = 0b001,
-    CR_60_100MHz = 0b000,
-    CR_35_60MHz = 0b011,
-    CR_20_35MHz = 0b010,
+    CR_250_300MHz = 0b0101, // HCLK / 124
+    CR_150_250MHz = 0b0100, // HCLK / 102
+    CR_100_150MHz = 0b0001, // HCLK / 62
+    CR_60_100MHz = 0b0000,  // HCLK / 42
+    CR_35_60MHz = 0b0011,   // HCLK / 26
+    CR_20_35MHz = 0b0010,   // HCLK / 16
 };
 
 /**
- * STM32 MACMIIAR register bitfield mapping.
+ * STM32H7 MACMDIOAR register bitfield mapping.
  */
-struct __attribute__((packed)) MacMiiAr {
-    bool miiBusy : 1;
-    bool miiWrite : 1;
-    ClockRange clockRange : 3;
+struct __attribute__((packed)) MacMdioAr {
+    bool busy : 1;
+    bool clause45Enable : 1;
+    uint8_t operation : 2;
+    bool skipAddressPacket : 1;
+    uint8_t : 3; // reserved
+    ClockRange clockRange : 4;
+    uint8_t trailingClocks : 3;
     uint8_t : 1; // reserved
-    uint16_t miiRegister : 5;
+    uint16_t registerId : 5;
     uint16_t phyAddress : 5;
-    uint16_t : 16; // reserved
+    bool backToBack : 1;
+    bool preambleSuppression : 1;
+    uint8_t : 4; // reserved
 
     static ClockRange getClockBits() {
-        unsigned int clock = SystemCoreClock;
+        // The MAC CSR clock is HCLK, after the AHB prescaler
+        static constexpr uint8_t ahbPrescalerShift[16] = {
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 6, 7, 8, 9};
+        const auto prescaler =
+            (RCC->D1CFGR & RCC_D1CFGR_HPRE) >> RCC_D1CFGR_HPRE_Pos;
+        const unsigned int clock =
+            SystemCoreClock >> ahbPrescalerShift[prescaler];
 
-        if (clock >= 150'000'000)
-            return CR_150_216MHz;
+        if (clock >= 250'000'000)
+            return CR_250_300MHz;
+        else if (clock >= 150'000'000)
+            return CR_150_250MHz;
         else if (clock >= 100'000'000)
             return CR_100_150MHz;
         else if (clock >= 60'000'000)
@@ -71,59 +86,55 @@ struct __attribute__((packed)) MacMiiAr {
     }
 
     /**
-     * Construct a MACMIIAR bitfield from a raw 32 bit value.
+     * Construct a MACMDIOAR bitfield from a raw 32 bit value.
      */
-    static MacMiiAr from(uint32_t value) {
-        MacMiiAr result;
-        std::memcpy(&result, &value, sizeof(MacMiiAr));
+    static MacMdioAr from(uint32_t value) {
+        MacMdioAr result;
+        std::memcpy(&result, &value, sizeof(MacMdioAr));
         return result;
     }
 
     /**
-     * Return a MACMIIAR bitfield as a 32 bit raw value.
+     * Return a MACMDIOAR bitfield as a 32 bit raw value.
      */
     operator uint32_t() const {
         uint32_t out = 0;
-        std::memcpy(&out, this, sizeof(MacMiiAr));
+        std::memcpy(&out, this, sizeof(MacMdioAr));
         return out;
     }
 };
-static_assert(sizeof(MacMiiAr) == 4, "MacMiiAr should be a 32bit register");
+static_assert(sizeof(MacMdioAr) == 4, "MacMdioAr should be a 32bit register");
+} // namespace
 
-[[maybe_unused]] void miiWrite(uint16_t phy, PHYRegister reg, uint16_t value) {
-    ETH->MACMIIDR = value;
-    ETH->MACMIIAR = MacMiiAr{
-        .miiBusy = 1,
-        .miiWrite = 1,
-        .clockRange = MacMiiAr::getClockBits(),
-        .miiRegister = static_cast<uint16_t>(reg),
+namespace mdio {
+void write(uint16_t phy, uint16_t reg, uint16_t value) {
+    ETH->MACMDIODR = value;
+    ETH->MACMDIOAR = MacMdioAr{
+        .busy = 1,
+        .operation = 0b01, // Clause 22 write
+        .clockRange = MacMdioAr::getClockBits(),
+        .registerId = static_cast<uint16_t>(reg),
         .phyAddress = phy,
     };
 
     // Wait for write operation complete
-    while (MacMiiAr::from(ETH->MACMIIAR).miiBusy)
+    while (MacMdioAr::from(ETH->MACMDIOAR).busy)
         ;
 }
 
-[[maybe_unused]] uint16_t miiRead(uint16_t phy, PHYRegister reg) {
-    ETH->MACMIIAR = MacMiiAr{
-        .miiBusy = 1,
-        .miiWrite = 0,
-        .clockRange = MacMiiAr::getClockBits(),
-        .miiRegister = static_cast<uint16_t>(reg),
+uint16_t read(uint16_t phy, uint16_t reg) {
+    ETH->MACMDIOAR = MacMdioAr{
+        .busy = 1,
+        .operation = 0b11, // Clause 22 read
+        .clockRange = MacMdioAr::getClockBits(),
+        .registerId = reg,
         .phyAddress = phy,
     };
 
     // Wait for read operation complete
-    while (MacMiiAr::from(ETH->MACMIIAR).miiBusy)
+    while (MacMdioAr::from(ETH->MACMDIOAR).busy)
         ;
 
-    return ETH->MACMIIDR;
+    return ETH->MACMDIODR;
 }
-} // namespace
-
-namespace phy {
-bool getLinkStatus(uint16_t phy) {
-    return miiRead(phy, PHYRegister::Status) & (1 << 2);
-}
-} // namespace phy
+} // namespace mdio
