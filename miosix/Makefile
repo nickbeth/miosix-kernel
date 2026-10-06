@@ -45,6 +45,7 @@ filesystem/littlefs/lfs_util.c                                             \
 filesystem/romfs/romfs.cpp                                                 \
 filesystem/socket/socket.cpp                                               \
 filesystem/socket/socket_impl.cpp                                          \
+filesystem/socket/netdb.cpp                                                \
 kercalls/libc_integration.cpp                                              \
 kercalls/libstdcpp_integration.cpp                                         \
 e20/e20.cpp                                                                \

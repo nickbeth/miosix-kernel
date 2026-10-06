@@ -53,7 +53,7 @@
 #define LWIP_SNMP_V3               (LWIP_SNMP)
 #endif
 
-#define LWIP_DNS                   0
+#define LWIP_DNS                   1
 #define LWIP_MDNS_RESPONDER        0
 
 #define LWIP_NUM_NETIF_CLIENT_DATA (LWIP_MDNS_RESPONDER)
@@ -72,6 +72,7 @@
 #define LWIP_SOCKET_SELECT              0
 #define LWIP_SOCKET_POLL                0
 #define LWIP_SO_RCVTIMEO                1
+#define LWIP_SO_SNDTIMEO                1
 #define LWIP_SO_RCVBUF                  1
 #define SO_REUSE                        1
 #define LWIP_DONT_PROVIDE_BYTEORDER_FUNCTIONS 1

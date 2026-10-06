@@ -39,7 +39,9 @@ extern "C" {
 /* Use the system provided errno */
 #define LWIP_ERRNO_STDINCLUDE 1
 
-// TODO: implement good source of random to LWIP_RAND()
+/* Use the system provided random number generator */
+#include <stdint.h>
+#define LWIP_RAND() ((uint32_t)rand())
 
 // TODO: byte order swap functions
 /*
