@@ -43,7 +43,7 @@ sudo apt install xz-utils curl gcc g++ make cmake libncurses5-dev byacc flex tex
 While on Fedora:
 
 ```
-sudo dnf install xz-utils curl gcc gcc-c++ make cmake ncurses-devel byacc flex texinfo patch tar unzip lzip elfutils-libelf-devel perl expat-devel
+sudo dnf install xz curl gcc gcc-c++ make cmake ncurses-devel byacc flex texinfo patch tar unzip lzip elfutils-libelf-devel perl expat-devel
 ```
 
 Note: the install scripts require `sudo`, unless you want to intall the compiler locally.
