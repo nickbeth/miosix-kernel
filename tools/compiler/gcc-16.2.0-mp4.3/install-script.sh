@@ -233,7 +233,7 @@ extract()
 		tar -xf "downloaded/$filename" || quit ":: Error extracting $label"
 		for patchfile in $@; do
 			echo "Applying ${patchfile}..."
-			patch -p0 < "$patchfile" || quit ":: Failed patching $label"
+			patch -p1 -d $directory < "$patchfile" || quit ":: Failed patching $label"
 		done
 	fi
 }
