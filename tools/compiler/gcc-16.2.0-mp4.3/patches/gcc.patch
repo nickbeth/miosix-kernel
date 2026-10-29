@@ -1,0 +1,2016 @@
+diff --git a/config/gthr.m4 b/config/gthr.m4
+index e8fac4a57..c38449725 100644
+--- a/config/gthr.m4
++++ b/config/gthr.m4
+@@ -35,6 +35,7 @@ case $1 in
+     dce)	thread_header=config/pa/gthr-dce.h ;;
+     gcn)	thread_header=config/gcn/gthr-gcn.h ;;
+     lynx)	thread_header=config/gthr-lynx.h ;;
++    miosix)	thread_header=config/gthr-miosix.h ;;
+     mipssde)	thread_header=config/mips/gthr-mipssde.h ;;
+     posix)	thread_header=gthr-posix.h ;;
+     rtems)	thread_header=config/gthr-rtems.h ;;
+diff --git a/gcc/builtins.cc b/gcc/builtins.cc
+index 692e20088..856381ebb 100644
+--- a/gcc/builtins.cc
++++ b/gcc/builtins.cc
+@@ -6637,12 +6637,21 @@ expand_builtin_sync_lock_test_and_set (machine_mode mode, tree exp,
+ static rtx
+ expand_builtin_sync_lock_release (machine_mode mode, tree exp)
+ {
+-  rtx mem;
+-
+-  /* Expand the operands.  */
+-  mem = get_builtin_sync_mem (CALL_EXPR_ARG (exp, 0), mode);
+-
+-  return expand_atomic_store (mem, const0_rtx, MEMMODEL_SYNC_RELEASE, true);
++  /* Patch set ID: atomics-fix */
++  /* Miosix patch begin: Generate the atomic store the long way because
++     just calling expand_atomic_store does not guarantee we generate any code */
++  unsigned int bytes_log2 = exact_log2 (GET_MODE_SIZE (mode).to_constant ());
++  gcc_assert (bytes_log2 < 5);
++  built_in_function fncode
++    = (built_in_function) ((int) BUILT_IN_ATOMIC_STORE_1 + bytes_log2);
++  tree const fn = builtin_decl_explicit (fncode);
++  tree target = CALL_EXPR_ARG (exp, 0);
++  tree sync = build_int_cst (integer_type_node, MEMMODEL_SYNC_RELEASE);
++  tree exp2 = build_call_expr (fn, 3, target,
++                              build_zero_cst (boolean_type_node),
++                              sync);
++  return expand_builtin (exp2, NULL_RTX, NULL_RTX, mode, false);
++  /* Miosix patch end */
+ }
+ 
+ /* Given an integer representing an ``enum memmodel'', verify its
+@@ -7225,9 +7234,21 @@ expand_builtin_atomic_clear (tree exp)
+      fail is if the bool type is larger than a word size.  Unlikely, but
+      handle it anyway for completeness.  Assume a single threaded model since
+      there is no atomic support in this case, and no barriers are required.  */
+-  rtx ret = expand_atomic_store (mem, const0_rtx, model, true);
+-  if (!ret)
+-    emit_move_insn (mem, const0_rtx);
++  /* Patch set ID: atomics-fix */
++  /* Miosix patch begin: As the comment above suggests, the case in which
++     expand_atomic_store failed was handled, but in the wrong way, just
++     generating a move, while it actually needed to call the __atomic_store
++     function. By generating the store the long way we avoid problems.
++     TODO: assuming that BOOL_TYPE_SIZE is 8 bits here, which is correct for
++     the architectures supported by Miosix. */
++  tree const fn = builtin_decl_explicit (BUILT_IN_ATOMIC_STORE_1);
++  tree target = CALL_EXPR_ARG (exp, 0);
++  tree sync = build_int_cst (integer_type_node, model);
++  tree exp2 = build_call_expr (fn, 3, target,
++                              build_zero_cst (boolean_type_node),
++                              sync);
++  expand_builtin (exp2, NULL_RTX, NULL_RTX, mode, false);
++  /* Miosix patch end */
+   return const0_rtx;
+ }
+ 
+diff --git a/gcc/config.gcc b/gcc/config.gcc
+index 743421768..58cb62fc6 100644
+--- a/gcc/config.gcc
++++ b/gcc/config.gcc
+@@ -1557,6 +1557,15 @@ arm*-*-eabi* | arm*-*-symbianelf* | arm*-*-rtems* | arm*-*-fuchsia*)
+ 	tmake_file="${tmake_file} arm/t-arm arm/t-arm-elf"
+ 	target_cpu_cname="arm7tdmi"
+ 	case ${target} in
++	arm*-miosix-eabi*)
++	  # Copy options from arm*-*-eabi*, add the miosix-specific ones
++	  # and make sure arm/t-arm-elf is not added to tmake_file
++	  tm_file="${tm_file} newlib-stdint.h miosix.h"           # Append
++	  tmake_file="arm/t-arm arm/t-arm-miosix arm/t-bpabi"     # Replace
++	  extra_options="${extra_options} miosix.opt"             # Append
++	  use_gcc_stdint=wrap
++	  target_cpu_cname="cortex-m0"
++	  ;;
+ 	arm*-*-eabi*)
+ 	  tm_file="$tm_file newlib-stdint.h"
+ 	  tmake_file="${tmake_file} arm/t-bpabi"
+diff --git a/gcc/config/arm/arm.cc b/gcc/config/arm/arm.cc
+index 41808e42a..f7eee4966 100644
+--- a/gcc/config/arm/arm.cc
++++ b/gcc/config/arm/arm.cc
+@@ -77,10 +77,20 @@
+ #include "aarch-common-protos.h"
+ #include "machmode.h"
+ #include "arm-builtins.h"
++#include "print-tree.h"
++#include <assert.h>
+ 
+ /* This file should be included last.  */
+ #include "target-def.h"
+ 
++/*
++ * https://gcc.gnu.org/legacy-ml/gcc/2017-05/msg00073.html
++ * Disable this warning at the compiler level, as Miosix skipped from GCC 4.7.3
++ * to GCC 9.2.0, so there's no affected code around.
++ */
++#undef warn_psabi /* in case it's already a macro */
++#define warn_psabi 0
++
+ /* Forward definitions of types.  */
+ typedef struct minipool_node    Mnode;
+ typedef struct minipool_fixup   Mfix;
+@@ -2842,8 +2852,33 @@ arm_init_libfuncs (void)
+ 	}
+   }
+ 
+-  if (TARGET_AAPCS_BASED)
+-    synchronize_libfunc = init_one_libfunc ("__sync_synchronize");
++  // Rationale:
++  // Compiling code that instantiates C++ static objects on architectures that do
++  // not have memory fence/barrier instructions (e.g: ARM7TDMI) causes undefined
++  // reference to `__sync_synchronize'.
++  // expand_mem_thread_fence() in gcc/optabs.cc:7350 tries to emit ASM insn
++  // and failing that, emits the __sync_synchronize call if available.
++  // Synchronize_libfunc is used only in optabs.c and defined only for ARM/MIPS
++  //
++  // $ grep -Rn 'synchronize_libfunc' gcc-14.2.0
++  // gcc/config/mips/mips.cc:13880:      synchronize_libfunc = init_one_libfunc ("__sync_synchronize");
++  // gcc/config/arm/arm.cc:2882:    synchronize_libfunc = init_one_libfunc ("__sync_synchronize");
++  // gcc/libfuncs.h:79:#define synchronize_libfunc        (libfunc_table[LTI_synchronize])
++  // gcc/optabs.cc:7361:  else if (synchronize_libfunc != NULL_RTX)
++  // gcc/optabs.cc:7362:    emit_library_call (synchronize_libfunc, LCT_NORMAL, VOIDmode);
++  //
++  // $ grep -Rn 'LTI_synchronize' gcc-14.2.0
++  // gcc/libfuncs.h:29:  LTI_synchronize,
++  // gcc/libfuncs.h:79:#define synchronize_libfunc        (libfunc_table[LTI_synchronize])
++  //
++  // The ARM implementation is in libgcc and only exists for linux and bsd.
++  //
++  // Solution: remove given ARM7TDMI don't need hardware memory barriers at all.
++  //
++  // When updating patches to new compiler, check that cortex-M targets have
++  // DMB instructions, while ARM7TDMI code has no calls to __sync_synchronize.
++  //if (TARGET_AAPCS_BASED)
++  //  synchronize_libfunc = init_one_libfunc ("__sync_synchronize");
+ 
+   speculation_barrier_libfunc = init_one_libfunc ("__speculation_barrier");
+ }
+@@ -8172,6 +8207,158 @@ calculate_pic_address_constant (rtx reg, rtx pic_reg, rtx orig)
+   return emit_insn (pat);
+ }
+ 
++// Patch set ID: miosix-processes-rodata
++// TODO: #ifdef _MIOSIX does not work in this context
++
++// Taken from varasm.cc, it is static unfortunately, hence the copy-paste
++static bool
++contains_pointers_p (const_tree type)
++{
++  switch (TREE_CODE (type))
++    {
++    case POINTER_TYPE:
++    case REFERENCE_TYPE:
++      /* I'm not sure whether OFFSET_TYPE needs this treatment,
++	 so I'll play safe and return 1.  */
++    case OFFSET_TYPE:
++      return true;
++
++    case RECORD_TYPE:
++    case UNION_TYPE:
++    case QUAL_UNION_TYPE:
++      {
++	tree fields;
++	/* For a type that has fields, see if the fields have pointers.  */
++	for (fields = TYPE_FIELDS (type); fields; fields = DECL_CHAIN (fields))
++	  if (TREE_CODE (fields) == FIELD_DECL
++	      && contains_pointers_p (TREE_TYPE (fields)))
++	    return true;
++	return false;
++      }
++
++    case ARRAY_TYPE:
++      /* An array type contains pointers if its element type does.  */
++      return contains_pointers_p (TREE_TYPE (type));
++
++    default:
++      return false;
++    }
++}
++
++/*
++ * Miosix processes do not live in a virtual address space.
++ * Their code and constants (.text and .rodata) live in FLASH at an address
++ * that is not known until runtime, so PC-relative addressing must be used.
++ * Their variables (.data and .bss) live in RAM, and the offset between
++ * .text and RAM is not constant, so the GOT must be used with single-pic-base.
++ * This function takes a memory reference and returns true if PC-relative
++ * addressing must be used, or false if the GOT must be used.
++ */
++static bool miosix_processes_ref_demux(rtx orig)
++{
++    // This logic has been kept from the original code in legitimize_pic_address
++    if(GET_CODE(orig) == LABEL_REF) return true;
++    
++    // From here on we handle the SYMBOL_REF case
++    //TODO: we don't do anything for DECL_WEAK
++
++    // Dump data structures for debugging purpose
++    // print-rtl.c and print-tree.c are very useful for knowing how they work
++    //debug_rtx(orig);
++    //if(SYMBOL_REF_DECL(orig)) debug_tree(SYMBOL_REF_DECL(orig));
++    
++    bool result = false;
++    const_tree decl = SYMBOL_REF_DECL(orig);
++    if(decl)
++    {
++        if(TREE_CODE(decl) == FUNCTION_DECL)
++        {
++            /*
++             * Taking function address, testcase (compile with -O2)
++             * void f();
++             * typedef void (*fp)();
++             * fp get() { return &f; }
++             */
++            result = true;
++            //printf("constant (FUNCTION_DECL)\n\n");
++        } else if(TREE_CODE(decl) == VAR_DECL) {
++            const_tree type = TREE_TYPE(decl);
++            assert(type != NULL && "Miosix: SYMBOL_REF of unknown constness (type==0)");
++            if(contains_pointers_p(type))
++            {
++                /*
++                 * A true constant pointer can't exist in Miosix processes.
++                 * If it's a constant, the pointer would need to be
++                 * initialized at the definition site, and since it may
++                 * point to a variable in RAM, a runtime relocation is
++                 * needed to initialize it, and because of that it can't
++                 * stay in .rodata among the true constants.
++                 * Const pointers without relocations may exist, say for
++                 * instance int *const p=0; and those *could* stay in .rodata
++                 * but that creates another problem: how do we know from
++                 * the declaration only (extern int *const p;) whether the
++                 * pointer is in .rodata or not? We can't and thus we don't
++                 * know whether to use pc-relative or GOT addressing, so
++                 * we treat *all* const pointers as non const.
++                 */
++                //printf("variable (contains pointers)\n\n");
++            } else if(decl_readonly_section(decl,0)) {
++                /*
++                 * Non-extern consts in non optimized code, testcase (compile with -O0)
++                 * const char str[]="Hello world\n";
++                 * const char *get() { return str; }
++                 */
++                result = true;
++                //printf("constant (decl_readonly_section)\n\n");
++                // remaining if are because decl_readonly_section misses some
++                // const cases
++            } else if(TYPE_READONLY(type)) {
++                /*
++                 * Extern const, testcase (compile with -O2)
++                 * extern const int aRodata;
++                 * int get() { return aRodata; }
++                 */
++                result = true;
++                //printf("constant (TYPE_READONLY)\n\n");
++            } else {
++                /*
++                 * Variables, testcase (compile with -O2)
++                 * extern int aData;
++                 * int get() { return aData; }
++                 */
++                //printf("variable (decl!=0)\n\n");
++            }
++        } else assert(0 && "Miosix: SYMBOL_REF of unknown constness (TREE_CODE?)");
++    } else {
++        // we fall here when optimizations are enabled and sometimes decl==NULL
++        
++        // NOTE: SYMBOL_REF_BLOCK() is valid only if SYMBOL_REF_HAS_BLOCK_INFO_P()
++        if(!SYMBOL_REF_HAS_BLOCK_INFO_P(orig) || SYMBOL_REF_BLOCK(orig) == NULL)
++            assert(0 && "Miosix: SYMBOL_REF of unknown constness (decl==0)");
++        
++        // TODO: output.h defines a few default sections as global variables
++        // do we need to handle more than readonly_data_section?
++        if(SYMBOL_REF_BLOCK(orig)->sect == readonly_data_section)
++        {
++            /*
++             * Non-folded constants when optimizing, testcase (compile with -O2)
++             * const int aRodata2=42;
++             * const int *get() { return &aRodata2; }
++             */
++            result = true;
++            //printf("constant (sect==readonly)\n\n");
++        } else {
++            /* Defined (not just declared) vars when optimizing, testcase (compile with -O2)
++             * int aData=1;
++             * int get() { return aData; }
++             */
++            //printf("variable (decl==0)\n\n");
++        }
++    }
++
++    return result;
++}
++
+ /* Legitimize PIC load to ORIG into REG.  If REG is NULL, a new pseudo is
+    created to hold the result of the load.  If not NULL, PIC_REG indicates
+    which register to use as PIC register, otherwise it is decided by register
+@@ -8197,6 +8384,9 @@ legitimize_pic_address (rtx orig, machine_mode mode, rtx reg, rtx pic_reg,
+ 	  reg = gen_reg_rtx (Pmode);
+ 	}
+ 
++      // Patch set ID: miosix-processes-rodata
++      bool miosix_ref_demux = miosix_processes_ref_demux(orig);
++
+       /* VxWorks does not impose a fixed gap between segments; the run-time
+ 	 gap can be different from the object-file gap.  We therefore can't
+ 	 use GOTOFF unless we are absolutely sure that the symbol is in the
+@@ -8206,15 +8396,8 @@ legitimize_pic_address (rtx orig, machine_mode mode, rtx reg, rtx pic_reg,
+       /* References to weak symbols cannot be resolved locally: they
+ 	 may be overridden by a non-weak definition at link time.  */
+       rtx_insn *insn;
+-      if ((LABEL_REF_P (orig)
+-	   || (SYMBOL_REF_P (orig)
+-	       && SYMBOL_REF_LOCAL_P (orig)
+-	       && (SYMBOL_REF_DECL (orig)
+-		   ? !DECL_WEAK (SYMBOL_REF_DECL (orig)) : 1)
+-	       && (!SYMBOL_REF_FUNCTION_P (orig)
+-		   || arm_fdpic_local_funcdesc_p (orig))))
+-	  && NEED_GOT_RELOC
+-	  && arm_pic_data_is_text_relative)
++      // Patch set ID: miosix-processes-rodata
++      if (miosix_ref_demux && NEED_GOT_RELOC && arm_pic_data_is_text_relative)
+ 	insn = arm_pic_static_addr (orig, reg);
+       else
+ 	{
+@@ -24978,6 +25161,22 @@ arm_assemble_integer (rtx x, unsigned int size, int aligned_p)
+       if (NEED_GOT_RELOC && flag_pic && making_const_table &&
+ 	  (SYMBOL_REF_P (x) || LABEL_REF_P (x)))
+ 	{
++	  /*
++	   * Patch set ID: miosix-processes-rodata
++	   * NOTE: On Miosix processes GOTOFF can't work, as we don't know at
++	   * time the offset between .text and .got/.data/whatever is in RAM
++	   * so always use GOT.
++	   * Without this patch a process with something as simple as
++	   * int *ptr = { 0 };
++	   * int *get() { return ptr; }
++	   * uses GOTOFF and produces segfaults upon calling get()
++	   * NOTE: compared to the original patch for gcc 9.2.0 which here only had
++	   * code to choose between GOT and GOTOFF, the new code also handles FDPIC
++	   * https://static.linaro.org/connect/sfo15/Presentations/09-24-Thursday/SFO15-406-%20ARM%20FDPIC%20Toolchains.pdf
++	   * but Miosix does not support fdpic (yet?)
++	   */
++      if (TARGET_FDPIC) assert(0 && "Miosix-patchd GCC does not support fdpic");
++
+ 	  /* See legitimize_pic_address for an explanation of the
+ 	     TARGET_VXWORKS_RTP check.  */
+ 	  /* References to weak symbols cannot be resolved locally:
+@@ -25006,7 +25205,10 @@ arm_assemble_integer (rtx x, unsigned int size, int aligned_p)
+ 
+ 		  if (!TARGET_FDPIC
+ 		      || arm_is_segment_info_known (x, &is_readonly))
+-		    fputs ("(GOTOFF)", asm_out_file);
++		    //Patch set ID: miosix-processes-rodata
++		    //All this if/else chain should always produce (GOT) in Miosix
++		    //fputs ("(GOTOFF)", asm_out_file);
++		    fputs ("(GOT)", asm_out_file);
+ 		  else
+ 		    fputs ("(GOT)", asm_out_file);
+ 		}
+diff --git a/gcc/config/arm/arm.h b/gcc/config/arm/arm.h
+index c97d79bda..16281cf94 100644
+--- a/gcc/config/arm/arm.h
++++ b/gcc/config/arm/arm.h
+@@ -940,7 +940,13 @@ extern const int arm_arch_cde_coproc_bits[];
+ #define EH_RETURN_STACKADJ_RTX	gen_rtx_REG (SImode, ARM_EH_STACKADJ_REGNUM)
+ 
+ #ifndef ARM_TARGET2_DWARF_FORMAT
+-#define ARM_TARGET2_DWARF_FORMAT DW_EH_PE_pcrel
++// Patch set ID: miosix-processes-exceptions
++//TODO: #ifdef _MIOSIX does not work in this context
++//Produce exception unwinding tables that work with Miosix processes
++//see processes-patch.md, section "The problem with unwinding exception tables"
++//we want pcrel as usual for the Miosix kernel, and datarel for processes (pic)
++#define ARM_TARGET2_DWARF_FORMAT (flag_pic ? DW_EH_PE_datarel : DW_EH_PE_pcrel)
++//#define ARM_TARGET2_DWARF_FORMAT DW_EH_PE_pcrel
+ #endif
+ 
+ /* ttype entries (the only interesting data references used)
+diff --git a/gcc/config/arm/sync.md b/gcc/config/arm/sync.md
+index de39a1f76..541dffc70 100644
+--- a/gcc/config/arm/sync.md
++++ b/gcc/config/arm/sync.md
+@@ -102,7 +102,7 @@
+   [(match_operand:QHSI 0 "register_operand")		;; val out
+    (match_operand:QHSI 1 "arm_sync_memory_operand")	;; memory
+    (match_operand:SI 2 "const_int_operand")]		;; model
+-  ""
++  "!TARGET_THUMB1" ;; Miosix Patch set ID: atomics-fix generate calls if we don't have ldrex/strex
+ {
+   memmodel model = memmodel_from_int (INTVAL (operands[2]));
+ 
+@@ -131,7 +131,7 @@
+   [(match_operand:QHSI 0 "arm_sync_memory_operand")	;; memory
+    (match_operand:QHSI 1 "register_operand")		;; store value
+    (match_operand:SI 2 "const_int_operand")]		;; model
+-  ""
++  "!TARGET_THUMB1" ;; Miosix Patch set ID: atomics-fix generate calls if we don't have ldrex/strex
+ {
+   memmodel model = memmodel_from_int (INTVAL (operands[2]));
+ 
+diff --git a/gcc/config/arm/t-arm-miosix b/gcc/config/arm/t-arm-miosix
+new file mode 100644
+index 000000000..ddb32efc5
+--- /dev/null
++++ b/gcc/config/arm/t-arm-miosix
+@@ -0,0 +1,124 @@
++
++## RATIONALE: build multilibs for all microcontroller-relevant ARM architectures
++## with and without `-fpie -msingle-pic-base' (for processes).
++## If processes were not required, we could have simply set the option
++## --with-multilib-list=rmprofile, which builds multilibs for exactly the
++## architectures we are interested in.
++
++## To update this file, have a look in t-multilib and t-rmprofile and bring over
++## new architectures/variants. Note that we are not building softfp ABI and
++## the directory structure is different than what is setup by t-rmprofile
++## (`-mfloat-abi=soft' is in the root directory, while rmprofile puts it in
++## the `soft' directory).
++##
++## Documentation for the variables set in this file are in
++##    https://gcc.gnu.org/onlinedocs/gccint/Target-Fragment.html
++
++MULTILIB_OPTIONS     =
++MULTILIB_DIRNAMES    =
++MULTILIB_MATCHES     =
++MULTILIB_EXCEPTIONS  =
++MULTILIB_REQUIRED    =
++MULTILIB_REUSE       =
++
++MULTILIB_OPTIONS    += marm/mthumb
++MULTILIB_DIRNAMES   += arm thumb
++
++# implicit default is set to armv6s-m (because explicit default -mcpu=cortex-m0)
++MULTILIB_OPTIONS    += march=armv4t/march=armv6s-m/march=armv7-m/march=armv7e-m/march=armv7e-m+fp/march=armv7e-m+fp.dp/march=armv8-m.base/march=armv8-m.main/march=armv8-m.main+fp/march=armv8-m.main+fp.dp
++MULTILIB_DIRNAMES   += v4t v6-m v7-m v7e-m v7e-m+fp v7e-m+dp v8-m.base v8-m.main v8-m.main+fp v8-m.main+dp
++
++# implicit default is -mfloat-abi=soft due to the fallback value of the TARGET_DEFAULT_FLOAT_ABI define
++MULTILIB_OPTIONS    += mfloat-abi=soft/mfloat-abi=hard
++MULTILIB_DIRNAMES   += nofp hard
++
++MULTILIB_OPTIONS    += qkernelspace
++MULTILIB_DIRNAMES   += kernel
++
++MULTILIB_OPTIONS    += fno-exceptions
++MULTILIB_DIRNAMES   += noexceptions
++
++## Multilibs to build:
++
++# Armv4 (ARM7TDMI, no FP)
++MULTILIB_REQUIRED	+= marm/march=armv4t/mfloat-abi=soft/qkernelspace
++MULTILIB_REQUIRED	+= marm/march=armv4t/mfloat-abi=soft/qkernelspace/fno-exceptions
++MULTILIB_REQUIRED	+= mthumb/march=armv4t/mfloat-abi=soft/qkernelspace
++MULTILIB_REQUIRED	+= mthumb/march=armv4t/mfloat-abi=soft/qkernelspace/fno-exceptions
++
++# Armv6 (Cortex-M0, M0+, M1, no FP)
++MULTILIB_REQUIRED	+= mthumb/march=armv6s-m/mfloat-abi=soft/qkernelspace
++MULTILIB_REQUIRED	+= mthumb/march=armv6s-m/mfloat-abi=soft/qkernelspace/fno-exceptions
++MULTILIB_REQUIRED	+= mthumb/march=armv6s-m/mfloat-abi=soft
++MULTILIB_REQUIRED	+= mthumb/march=armv6s-m/mfloat-abi=soft/fno-exceptions
++
++# Armv7-M (Cortex-M3, M4, M7, no FP)
++MULTILIB_REQUIRED	+= mthumb/march=armv7-m/mfloat-abi=soft/qkernelspace
++MULTILIB_REQUIRED	+= mthumb/march=armv7-m/mfloat-abi=soft/qkernelspace/fno-exceptions
++MULTILIB_REQUIRED	+= mthumb/march=armv7-m/mfloat-abi=soft
++MULTILIB_REQUIRED	+= mthumb/march=armv7-m/mfloat-abi=soft/fno-exceptions
++
++# Armv7e-M (Cortex-M4, M7 with FP single and double precision)
++MULTILIB_REQUIRED	+= mthumb/march=armv7e-m+fp/mfloat-abi=hard/qkernelspace
++MULTILIB_REQUIRED	+= mthumb/march=armv7e-m+fp/mfloat-abi=hard/qkernelspace/fno-exceptions
++MULTILIB_REQUIRED	+= mthumb/march=armv7e-m+fp/mfloat-abi=hard
++MULTILIB_REQUIRED	+= mthumb/march=armv7e-m+fp/mfloat-abi=hard/fno-exceptions
++MULTILIB_REQUIRED	+= mthumb/march=armv7e-m+fp.dp/mfloat-abi=hard/qkernelspace
++MULTILIB_REQUIRED	+= mthumb/march=armv7e-m+fp.dp/mfloat-abi=hard/qkernelspace/fno-exceptions
++MULTILIB_REQUIRED	+= mthumb/march=armv7e-m+fp.dp/mfloat-abi=hard
++MULTILIB_REQUIRED	+= mthumb/march=armv7e-m+fp.dp/mfloat-abi=hard/fno-exceptions
++
++# Armv8-m baseline (Cortex-M23, no FP)
++MULTILIB_REQUIRED	+= mthumb/march=armv8-m.base/mfloat-abi=soft/qkernelspace
++MULTILIB_REQUIRED	+= mthumb/march=armv8-m.base/mfloat-abi=soft/qkernelspace/fno-exceptions
++MULTILIB_REQUIRED	+= mthumb/march=armv8-m.base/mfloat-abi=soft
++MULTILIB_REQUIRED	+= mthumb/march=armv8-m.base/mfloat-abi=soft/fno-exceptions
++
++# Armv8-m mainline (Cortex-M33, M35P with FP single and double precision)
++MULTILIB_REQUIRED	+= mthumb/march=armv8-m.main+fp/mfloat-abi=hard/qkernelspace
++MULTILIB_REQUIRED	+= mthumb/march=armv8-m.main+fp/mfloat-abi=hard/qkernelspace/fno-exceptions
++MULTILIB_REQUIRED	+= mthumb/march=armv8-m.main+fp/mfloat-abi=hard
++MULTILIB_REQUIRED	+= mthumb/march=armv8-m.main+fp/mfloat-abi=hard/fno-exceptions
++MULTILIB_REQUIRED	+= mthumb/march=armv8-m.main+fp.dp/mfloat-abi=hard/qkernelspace
++MULTILIB_REQUIRED	+= mthumb/march=armv8-m.main+fp.dp/mfloat-abi=hard/qkernelspace/fno-exceptions
++MULTILIB_REQUIRED	+= mthumb/march=armv8-m.main+fp.dp/mfloat-abi=hard
++MULTILIB_REQUIRED	+= mthumb/march=armv8-m.main+fp.dp/mfloat-abi=hard/fno-exceptions
++
++## Aliases
++
++# Once upon a time, Armv6 had a variant Armv6s with support for the SVC
++# instruction, but it was an undocumented variant which then got merged in the
++# base Armv6 standard. This rule always aliases armv6 to armv6s as they are
++# equivalent for all intents and purposes
++MULTILIB_MATCHES	+= march?armv6s-m=march?armv6-m
++
++# Map v7e no FPU to v7
++MULTILIB_MATCHES        += march?armv7-m=march?armv7e-m
++
++# Map v8.main no FPU to v8.base
++MULTILIB_MATCHES        += march?armv8-m.base=march?armv8-m.main
++
++# Map all v8-m.main+dsp FP variants down the the variant without DSP.
++MULTILIB_MATCHES	+= march?armv8-m.main=march?armv8-m.main+dsp
++MULTILIB_MATCHES	+= $(foreach FP, +fp +fp.dp, march?armv8-m.main$(FP)=march?armv8-m.main+dsp$(FP))
++
++# For single-precision only fpv5, use the base fp libraries
++MULTILIB_MATCHES	+= march?armv7e-m+fp=march?armv7e-m+fpv5
++
++# For architectures with no FPU, map unspecified -mfloat-abi to soft
++# Note: the t-rmprofile fragment does not do this, even though it is required,
++# because the main makefile (config.gcc) special-cases this by setting
++# with_float="soft" which results in all invocations to have the default
++# option "--with-float=soft"
++MULTILIB_REUSE		+= $(foreach ABI, mthumb marm, \
++			$(ABI)/march.armv4t/mfloat-abi.soft/qkernelspace=$(ABI)/march.armv4t/qkernelspace)
++MULTILIB_REUSE		+= $(foreach ABI, mthumb marm, \
++			$(ABI)/march.armv4t/mfloat-abi.soft/qkernelspace/fno-exceptions=$(ABI)/march.armv4t/qkernelspace/fno-exceptions)
++MULTILIB_REUSE		+= $(foreach ARCH, armv6s-m armv7-m armv8-m\.base, \
++			mthumb/march.$(ARCH)/mfloat-abi.soft/qkernelspace=mthumb/march.$(ARCH)/qkernelspace)
++MULTILIB_REUSE		+= $(foreach ARCH, armv6s-m armv7-m armv8-m\.base, \
++			mthumb/march.$(ARCH)/mfloat-abi.soft/qkernelspace/fno-exceptions=mthumb/march.$(ARCH)/qkernelspace/fno-exceptions)
++MULTILIB_REUSE		+= $(foreach ARCH, armv6s-m armv7-m armv8-m\.base, \
++			mthumb/march.$(ARCH)/mfloat-abi.soft=mthumb/march.$(ARCH))
++MULTILIB_REUSE		+= $(foreach ARCH, armv6s-m armv7-m armv8-m\.base, \
++			mthumb/march.$(ARCH)/mfloat-abi.soft/fno-exceptions=mthumb/march.$(ARCH)/fno-exceptions)
+diff --git a/gcc/config/miosix.h b/gcc/config/miosix.h
+new file mode 100644
+index 000000000..901370e60
+--- /dev/null
++++ b/gcc/config/miosix.h
+@@ -0,0 +1,118 @@
++/* Target definitions for the Miosix RTOS. */
++
++/* RATIONALE: adding builtin_define to always define _MIOSIX
++   - when libgcc/libstdc++/newlib are compiled, as there are some #ifdef _MIOSIX
++   - when Miosix processes are compiled, to allow #ifdef _MIOSIX
++   Also add versioning to miosix-specific compiler patches, and specs for
++   making GCC compile Miosix processes by default. */
++
++#undef  TARGET_OS_CPP_BUILTINS
++#define TARGET_OS_CPP_BUILTINS()                    \
++  do                                                \
++    {                                               \
++      TARGET_BPABI_CPP_BUILTINS ();                 \
++      builtin_define ("_MIOSIX");                   \
++      builtin_define ("_MIOSIX_GCC_PATCH_MAJOR=4"); \
++      builtin_define ("_MIOSIX_GCC_PATCH_MINOR=2"); \
++      builtin_assert ("system=miosix");             \
++    }                                               \
++  while (0)
++
++/* Force -fpie -msingle-pic-base for Miosix process object files */
++#undef  OS_CC1_SPEC
++#define OS_CC1_SPEC "%{!qkernelspace:-fpie -msingle-pic-base}"
++
++/* No crti.o/crtbegin.o/crt0.o */
++#undef  STARTFILE_SPEC
++#define STARTFILE_SPEC ""
++
++/* No crtend.o/crtn.o */
++#undef  ENDFILE_SPEC
++#define ENDFILE_SPEC ""
++
++/* Library specs for Miosix processes */
++
++/* STD_LIB_SPEC is the default value of LIB_SPEC as defined in gcc.cc, what it
++   does is to expand to -lc in most cases except if profiling is enabled. */
++#define STD_LIB_SPEC "%{!shared:%{g*:-lg} %{!p:%{!pg:-lc}}%{p:-lc_p}%{pg:-lc_p}}"
++
++/* Includes libsyscalls and libatomic if -qkernelspace is not specified, and
++   the libraries are found.
++   If -lstdc++ is used, move it inside the system LIB_SPEC because in Miosix
++   it has a circular dependency on -lsyscalls. Also -lm must be moved in
++   because -lstdc++ depends on -lm.*/
++/* The case in which the libraries are not found is important to allow the
++   configure steps for GCC's libraries to succeed, because they try to compile
++   linked executables (even though they shouldn't need to!). */
++/* This spec goes unused if -nostlib is passed to gcc (i.e. we don't
++   have to handle that case manually ourselves). Additionally, it is also
++   inside a --start-group --end-group. This is implemented in
++   the parent spec LINK_GCC_C_SEQUENCE_SPEC in unknown-elf.h. */
++/* IMPORTANT: we CANNOT remove the -lstdc++ outfile because LIB_SPEC
++   is evaluated TWICE: one time for creating the --pass-through-libs=...
++   arguments to the linker, the other for adding the libraries to the command
++   line. This is not evident because of too many levels of indirection, but
++   it happens like this:
++     LINK_COMMAND_SPEC
++       string-includes LINK_PLUGIN_SPEC
++         uses %(link_gcc_c_sequence) to invoke LINK_GCC_C_SEQUENCE_SPEC
++           uses %L to invoke LIB_SPEC
++       uses %X to add the output files to the commandline
++       uses %(link_gcc_c_sequence) to invoke LINK_GCC_C_SEQUENCE_SPEC
++         uses %L to invoke LIB_SPEC
++   Unfortunately the output files are added to the linker's command line
++   (by spec command %X) before the second call of LIB_SPEC, so it is basically
++   impossible to remove -lstdc++ once it is added again here.
++   There is no other way to handle libstdc++ because its presence is not
++   defined in any spec string, instead it is hardcoded directly in the
++   C++ driver. */
++#undef  LIB_SPEC
++#define LIB_SPEC \
++  "%{!qkernelspace: \
++     %:if-exists-then-else(libsyscalls.a%s -lsyscalls) \
++     %:if-exists-then-else(libatomic.a%s -latomic) \
++     %{%:find-outfile(-lstdc++):-lstdc++ -lm}} " STD_LIB_SPEC
++
++/* Linker specs for Miosix processes */
++
++/* Always remove -lpthread because its functions are already defined either by
++   the rest of the kernel, or by libsyscalls for processes.
++   Also add required options for processes to the linker's command line if
++   -qkernelspace is not specified. Note that the default LINK_SPEC is empty. */
++#undef  LINK_SPEC
++#define LINK_SPEC \
++  "%:remove-outfile(-lpthread) \
++   %{!qkernelspace:-n -pie --spare-dynamic-tags 3 --target2=mx-data-rel}"
++   
++/* Additional linker options for Miosix processes */
++
++/* If compiling a process executable (no -qkernelspace) and no custom linker
++   script is specified (no -T on command line) add the default linker script.
++   Linker scripts must go at the end of the linker's command line, otherwise
++   they would not be searched in all paths. */
++/* Unfortunately, there is no spec for adding a linker script, so we have to
++   modify the whole LINK_COMMAND_SPEC. This is not even unusual, darwin.h
++   also does it. In the future we might even want to customize this spec
++   even more, but it needs to kept synchronized with the original one in
++   gcc.cc. The modified part is just after %{T*}, the rest is the same. */
++#undef  LINK_COMMAND_SPEC
++#define LINK_COMMAND_SPEC "\
++%{!fsyntax-only:%{!c:%{!M:%{!MM:%{!E:%{!S:\
++    %(linker) " \
++    LINK_PLUGIN_SPEC \
++   "%{flto|flto=*:%<fcompare-debug*} \
++    %{flto} %{fno-lto} %{flto=*} %l " LINK_PIE_SPEC \
++   "%{fuse-ld=*:-fuse-ld=%*} " LINK_COMPRESS_DEBUG_SPEC \
++   "%X %{o*} %{e*} %{N} %{n} %{r}\
++    %{s} %{t} %{u*} %{z} %{Z} %{!nostdlib:%{!r:%{!nostartfiles:%S}}} \
++    %{static|no-pie|static-pie:} %@{L*} %(link_libgcc) " \
++    VTABLE_VERIFICATION_SPEC " " SANITIZER_EARLY_SPEC " %o "" \
++    %{fopenacc|fopenmp|%:gt(%{ftree-parallelize-loops=*:%*} 1):\
++    %:include(libgomp.spec)%(link_gomp)}\
++    %{fgnu-tm:%:include(libitm.spec)%(link_itm)}\
++    " STACK_SPLIT_SPEC "\
++    %{fprofile-arcs|fcondition-coverage|fpath-coverage|fprofile-generate*|coverage:-lgcov} " SANITIZER_SPEC " \
++    %{!nostdlib:%{!r:%{!nodefaultlibs:%(link_ssp) %(link_gcc_c_sequence)}}}\
++    %{!nostdlib:%{!r:%{!nostartfiles:%E}}} \
++    %{T*} %{!qkernelspace:%{!T:-T miosix_process.ld}} \
++    \n%(post_link) }}}}}}"
+diff --git a/gcc/config/miosix.opt b/gcc/config/miosix.opt
+new file mode 100644
+index 000000000..916562eb7
+--- /dev/null
++++ b/gcc/config/miosix.opt
+@@ -0,0 +1,11 @@
++; Specify handling of compiler options for Miosix.
++
++; The -pthread option does nothing on Mioisx, as threads are always enabled, but
++; we support it as many build scripts hardcode it, including libgomp and cmake
++pthread
++Ignore
++
++qkernelspace
++Driver
++
++; This comment is to ensure we retain the blank line above.
+diff --git a/gcc/config/miosix.opt.urls b/gcc/config/miosix.opt.urls
+new file mode 100644
+index 000000000..2ae359842
+--- /dev/null
++++ b/gcc/config/miosix.opt.urls
+@@ -0,0 +1,6 @@
++; Manual stub urls file for gcc/config/miosix.opt
++
++; skipping UrlSuffix for 'pthread' due to multiple URLs:
++;   duplicate: 'gcc/Link-Options.html#index-pthread-1'
++;   duplicate: 'gcc/Preprocessor-Options.html#index-pthread'
++
+diff --git a/gcc/configure b/gcc/configure
+index 4a90e86ed..a069fdbed 100755
+--- a/gcc/configure
++++ b/gcc/configure
+@@ -13219,7 +13219,7 @@ case ${enable_threads} in
+     # default
+     target_thread_file='single'
+     ;;
+-  aix | dce | lynx | mipssde | posix | rtems | \
++  aix | dce | lynx | miosix | mipssde | posix | rtems | \
+   single | tpf | vxworks | win32 | mcf)
+     target_thread_file=${enable_threads}
+     ;;
+diff --git a/gcc/configure.ac b/gcc/configure.ac
+index abf5e4f4e..11fb57925 100644
+--- a/gcc/configure.ac
++++ b/gcc/configure.ac
+@@ -2109,7 +2109,7 @@ case ${enable_threads} in
+     # default
+     target_thread_file='single'
+     ;;
+-  aix | dce | lynx | mipssde | posix | rtems | \
++  aix | dce | lynx | miosix | mipssde | posix | rtems | \
+   single | tpf | vxworks | win32 | mcf)
+     target_thread_file=${enable_threads}
+     ;;
+diff --git a/gcc/except.cc b/gcc/except.cc
+index 98876833e..e67c2a81d 100644
+--- a/gcc/except.cc
++++ b/gcc/except.cc
+@@ -3075,6 +3075,12 @@ output_one_function_exception_table (int section)
+   else
+     {
+       tt_format = ASM_PREFERRED_EH_DATA_FORMAT (/*code=*/0, /*global=*/1);
++      // Patch set ID: miosix-processes-exceptions
++      // This is here for debugging the change to ARM_TARGET2_DWARF_FORMAT
++      // in Miosix processes: when compiling C++ code that throws and catches
++      // exceptions, it should print 0x10 (DW_EH_PE_pcrel) when compiling the
++      // kernel (non-pic) and 0x30 (DW_EH_PE_datarel) when compiling processes
++      //printf("\n\n-- called 0x%x --\n\n",tt_format);
+       if (HAVE_AS_LEB128)
+ 	ASM_GENERATE_INTERNAL_LABEL (ttype_label,
+ 				     section ? "LLSDATTC" : "LLSDATT",
+diff --git a/gcc/gcc.cc b/gcc/gcc.cc
+index 43b0158ee..2f7320772 100644
+--- a/gcc/gcc.cc
++++ b/gcc/gcc.cc
+@@ -448,6 +448,7 @@ static const char *if_exists_spec_function (int, const char **);
+ static const char *if_exists_else_spec_function (int, const char **);
+ static const char *if_exists_then_else_spec_function (int, const char **);
+ static const char *sanitize_spec_function (int, const char **);
++static const char *find_outfile_spec_function (int, const char **);
+ static const char *replace_outfile_spec_function (int, const char **);
+ static const char *remove_outfile_spec_function (int, const char **);
+ static const char *version_compare_spec_function (int, const char **);
+@@ -1810,6 +1811,7 @@ static const struct spec_function static_spec_functions[] =
+   { "if-exists-else",		if_exists_else_spec_function },
+   { "if-exists-then-else",	if_exists_then_else_spec_function },
+   { "sanitize",			sanitize_spec_function },
++  { "find-outfile",		find_outfile_spec_function },
+   { "replace-outfile",		replace_outfile_spec_function },
+   { "remove-outfile",		remove_outfile_spec_function },
+   { "version-compare",		version_compare_spec_function },
+@@ -10613,6 +10615,27 @@ sanitize_spec_function (int argc, const char **argv)
+   return NULL;
+ }
+ 
++/* find-outfile built-in spec function.
++
++   This looks for the first argument in the outfiles array's name and
++   returns the empty string if found.  */
++
++static const char *
++find_outfile_spec_function (int argc, const char **argv)
++{
++  int i;
++  /* Must have exactly one argument.  */
++  if (argc != 1)
++    abort ();
++
++  for (i = 0; i < n_infiles; i++)
++    {
++      if (outfiles[i] && !filename_cmp (outfiles[i], argv[0]))
++        return "";
++    }
++  return NULL;
++}
++
+ /* replace-outfile built-in spec function.
+ 
+    This looks for the first argument in the outfiles array's name and
+diff --git a/gcc/optabs.cc b/gcc/optabs.cc
+index 111b9be99..371b63f27 100644
+--- a/gcc/optabs.cc
++++ b/gcc/optabs.cc
+@@ -7621,29 +7621,21 @@ expand_atomic_load (rtx target, rtx mem, enum memmodel model)
+       delete_insns_since (last);
+     }
+ 
+-  /* If the size of the object is greater than word size on this target,
+-     then we assume that a load will not be atomic.  We could try to
+-     emulate a load with a compare-and-swap operation, but the store that
+-     doing this could result in would be incorrect if this is a volatile
+-     atomic load or targetting read-only-mapped memory.  */
+-  if (maybe_gt (GET_MODE_PRECISION (mode), BITS_PER_WORD))
+-    /* If there is no atomic load, leave the library call.  */
+-    return NULL_RTX;
+-
+-  /* Otherwise assume loads are atomic, and emit the proper barriers.  */
+-  if (!target || target == const0_rtx)
+-    target = gen_reg_rtx (mode);
+-
+-  /* For SEQ_CST, emit a barrier before the load.  */
+-  if (is_mm_seq_cst (model))
+-    expand_mem_thread_fence (model);
+-
+-  emit_move_insn (target, mem);
+-
+-  /* Emit the appropriate barrier after the load.  */
+-  expand_mem_thread_fence (model);
+-
+-  return target;
++  /* Patch set ID: atomics-fix */
++  /* Miosix patch begin
++     Upstream, there is codegen here that assumes one could always use a normal
++     load wrapped around some barriers if there are no architecture specific
++     pattern for atomic_load AND the size of the value is <= the architecture's
++     word size. But this is of course wrong if for other atomics we are using
++     lock-based implementations in all cases. This is pointed out in
++     bug report https://gcc.gnu.org/bugzilla/show_bug.cgi?id=86005, but
++     the maintainers don't seem forthcoming in addressing the problem.
++     Since this issue affects Miosix specifically, we patch it ourselves
++     for now by always using the code-path for objects that are not a
++     supported word size. */
++  /* Leave the library call. */
++  return NULL_RTX;
++  /* Miosix patch end */
+ }
+ 
+ /* This function expands the atomic store operation:
+@@ -7698,36 +7690,33 @@ expand_atomic_store (rtx mem, rtx val, enum memmodel model, bool use_release)
+ 	}
+     }
+ 
+-  /* If the size of the object is greater than word size on this target,
+-     a default store will not be atomic.  */
+-  if (maybe_gt (GET_MODE_PRECISION (mode), BITS_PER_WORD))
+-    {
+-      /* If loads are atomic or we are called to provide a __sync builtin,
+-	 we can try a atomic_exchange and throw away the result.  Otherwise,
+-	 don't do anything so that we do not create an inconsistency between
+-	 loads and stores.  */
+-      if (can_atomic_load_p (mode) || is_mm_sync (model))
+-	{
+-	  rtx target = maybe_emit_atomic_exchange (NULL_RTX, mem, val, model);
+-	  if (!target)
+-	    target = maybe_emit_compare_and_swap_exchange_loop (NULL_RTX, mem,
+-								val);
+-	  if (target)
+-	    return const0_rtx;
+-	}
+-        return NULL_RTX;
++  /* Patch set ID: atomics-fix */
++  /* Miosix patch begin
++     Upstream, there is codegen here that assumes one could always use a normal
++     store wrapped around some barriers if there are no architecture specific
++     pattern for atomic_store. But this is of course wrong if for other atomics
++     we are using lock-based implementations. This is pointed out in
++     bug report https://gcc.gnu.org/bugzilla/show_bug.cgi?id=86005, but
++     the maintainers don't seem forthcoming in addressing the problem.
++     Since this issue affects Miosix specifically, we patch it ourselves
++     for now by always using the code-path for objects that are not a
++     supported word size. */
++  /* If loads are atomic or we are called to provide a __sync builtin,
++      we can try a atomic_exchange and throw away the result.  Otherwise,
++      don't do anything so that we do not create an inconsistency between
++      loads and stores.  */
++  if (can_atomic_load_p (mode) || is_mm_sync (model))
++    {
++      rtx target = maybe_emit_atomic_exchange (NULL_RTX, mem, val, model);
++      if (!target)
++        target = maybe_emit_compare_and_swap_exchange_loop (NULL_RTX, mem,
++                                                            val);
++      if (target)
++        return const0_rtx;
+     }
+-
+-  /* Otherwise assume stores are atomic, and emit the proper barriers.  */
+-  expand_mem_thread_fence (model);
+-
+-  emit_move_insn (mem, val);
+-
+-  /* For SEQ_CST, also emit a barrier after the store.  */
+-  if (is_mm_seq_cst (model))
+-    expand_mem_thread_fence (model);
+-
+-  return const0_rtx;
++  /* Leave the library call. */
++  return NULL_RTX;
++  /* Miosix patch end */
+ }
+ 
+ 
+diff --git a/libatomic/config/miosix/host-config.h b/libatomic/config/miosix/host-config.h
+new file mode 100644
+index 000000000..61cff5794
+--- /dev/null
++++ b/libatomic/config/miosix/host-config.h
+@@ -0,0 +1,23 @@
++
++/*
++ * According to libatomic_i.h, here we should implement
++ * - UWORD protect_start(void *ptr);
++ * - void protect_end(void *ptr, UWORD token);
++ * which are used by fop_n.c fop_n.c cas_n.c exch_n.c tas_n.c store_n.c for
++ * 'small' operations.
++ */
++
++unsigned int libat_quick_lock_n(void *ptr);
++void libat_quick_unlock_n(void *ptr, unsigned int token);
++
++static inline UWORD protect_start(void *ptr)
++{
++	return libat_quick_lock_n(ptr);
++}
++
++static inline void protect_end(void *ptr, UWORD token)
++{
++	libat_quick_unlock_n(ptr, token);
++}
++
++#include_next <host-config.h>
+diff --git a/libatomic/config/miosix/lock.c b/libatomic/config/miosix/lock.c
+new file mode 100644
+index 000000000..b58431e94
+--- /dev/null
++++ b/libatomic/config/miosix/lock.c
+@@ -0,0 +1,13 @@
++
++/*
++ * According to libatomic_i.h, here we should implement
++ * - void libat_lock_n(void *ptr, size_t n);
++ * - void libat_unlock_n(void *ptr, size_t n);
++ * which are used by gexch.c gcas.c gload.c gstore.c for 'large' operations.
++ *
++ * Except, we don't. These function may be directly implemented in Miosix should
++ * the need arise, or intentionally left as undefined references if large
++ * locking intrinsics are to be disallowed.
++ */
++
++#include "libatomic_i.h"
+diff --git a/libatomic/configure.tgt b/libatomic/configure.tgt
+index 026856e7f..3d7a04465 100644
+--- a/libatomic/configure.tgt
++++ b/libatomic/configure.tgt
+@@ -192,6 +192,10 @@ case "${target}" in
+         esac
+ 	;;
+ 
++  arm*-miosix-eabi*)
++	config_path="miosix"
++	;;
++
+   *-*-rtems*)
+ 	XCFLAGS="${configure_tgt_pre_target_cpu_XCFLAGS}"
+ 	config_path="rtems"
+diff --git a/libatomic/tas_n.c b/libatomic/tas_n.c
+index 5e2d12c9a..779abf30c 100644
+--- a/libatomic/tas_n.c
++++ b/libatomic/tas_n.c
+@@ -115,3 +115,17 @@ SIZE(libat_test_and_set) (UTYPE *mptr, int smodel UNUSED)
+ 
+ EXPORT_ALIAS (SIZE(test_and_set));
+ #undef LAT_TAS_N
++
++// Miosix patch begin
++// Since bug https://gcc.gnu.org/bugzilla/show_bug.cgi?id=109166 was fixed,
++// GCC can generate calls to __atomic_test_and_set() but libatomic does not
++// provide a fallback implementation, causing builds of Miosix for armv6m
++// platforms (Cortex-M0) to potentially fail with linking errors.
++//   To fix the problem in the interim (while we wait for upstream to fix it
++// properly) we implement __atomic_test_and_set by aliasing it to
++// __atomic_test_and_set_1.
++#if N == 1 && !SIZE(HAVE_ATOMIC_TAS)
++extern bool __atomic_test_and_set (void *mptr, int smodel)
++  __attribute__((alias("libat_test_and_set_1")));
++#endif
++// Miosix patch end
+diff --git a/libgcc/config/arm/pr-support.c b/libgcc/config/arm/pr-support.c
+index 3e6e0991b..a86564717 100644
+--- a/libgcc/config/arm/pr-support.c
++++ b/libgcc/config/arm/pr-support.c
+@@ -425,7 +425,14 @@ _Unwind_GetLanguageSpecificData (_Unwind_Context * context)
+ _Unwind_Ptr
+ _Unwind_GetDataRelBase (_Unwind_Context *context __attribute__ ((unused)))
+ {
+-  abort ();
++// TODO: #ifdef _MIOSIX does not work in this context
++// Support exception unwinding that work with Miosix processes
++// see processes-patch.md, section "The problem with unwinding exception tables"
++// NOTE: this code gets linked (even though it never gets used) also in the kernel,
++// so the symbol name we choose here must also exist in the kernel linker scripts
++  extern char _data asm("_data"); //defined in the linker script
++  return (_Unwind_Ptr) &_data;
++//   abort ();
+ }
+ 
+ _Unwind_Ptr
+diff --git a/libgcc/config/arm/unwind-arm.h b/libgcc/config/arm/unwind-arm.h
+index ac476a369..637ee1c20 100644
+--- a/libgcc/config/arm/unwind-arm.h
++++ b/libgcc/config/arm/unwind-arm.h
+@@ -82,6 +82,12 @@ static inline _Unwind_Ptr _Unwind_gnu_Find_got (_Unwind_Ptr ptr)
+ #elif defined(__symbian__) || defined(__uClinux__)
+ #define _GLIBCXX_OVERRIDE_TTYPE_ENCODING (DW_EH_PE_absptr)
+       /* Absolute pointer.  Nothing more to do.  */
++#elif defined(_MIOSIX)
++     // DO NOT DEFINE _GLIBCXX_OVERRIDE_TTYPE_ENCODING, we don't want that kludge
++     // as the encoding could be either pc-relative (kernel) or data-relative (processes)
++     // see processes-patch.md
++     // This relies on base_of_encoded_value() setting base to 0 for DW_EH_PE_pcrel
++     tmp += base ? base : ptr;
+ #else
+ #define _GLIBCXX_OVERRIDE_TTYPE_ENCODING (DW_EH_PE_pcrel)
+       /* Pc-relative pointer.  */
+diff --git a/libgcc/config/gthr-miosix.h b/libgcc/config/gthr-miosix.h
+new file mode 100644
+index 000000000..6d82fcd02
+--- /dev/null
++++ b/libgcc/config/gthr-miosix.h
+@@ -0,0 +1,94 @@
++
++// RATIONALE: make the code generated by GCC thread safe by providing a thread model
++
++#ifndef GCC_GHTR_MIOSIX_H
++#define GCC_GHTR_MIOSIX_H
++
++#include <pthread.h>
++#include <unistd.h>
++#include <sched.h>
++#include <time.h>
++
++// Note to self: gthr.h contains useful information
++// on how a gthr-xxx.h should look like
++
++#define __GTHREADS 1
++#define __GTHREAD_HAS_COND 1
++#define __GTHREADS_CXX0X 1
++// Found in libstdc++
++#define _GTHREAD_USE_MUTEX_TIMEDLOCK 1
++
++// In Miosix, threads are always enabled, period.
++#define __gthread_active_p() 1
++
++typedef pthread_t       __gthread_t;
++typedef pthread_key_t   __gthread_key_t;
++typedef pthread_once_t  __gthread_once_t;
++typedef pthread_mutex_t __gthread_mutex_t;
++typedef pthread_mutex_t __gthread_recursive_mutex_t;
++typedef pthread_cond_t  __gthread_cond_t;
++typedef struct timespec __gthread_time_t;
++
++#define __GTHREAD_ONCE_INIT                     PTHREAD_ONCE_INIT
++#define __GTHREAD_MUTEX_INIT                    PTHREAD_MUTEX_INITIALIZER
++#define __GTHREAD_MUTEX_INIT_FUNCTION           __gthread_mutex_init_function
++#define __GTHREAD_RECURSIVE_MUTEX_INIT          PTHREAD_MUTEX_RECURSIVE_INITIALIZER_NP
++#define __GTHREAD_RECURSIVE_MUTEX_INIT_FUNCTION __gthread_recursive_mutex_init_function
++#define __GTHREAD_COND_INIT                     PTHREAD_COND_INITIALIZER
++#define __GTHREAD_COND_INIT_FUNCTION            __gthread_cond_init_function
++#define __GTHREAD_TIME_INIT                     {0,0}
++
++#define __gthread_once                      pthread_once
++#define __gthread_mutex_destroy             pthread_mutex_destroy
++#define __gthread_recursive_mutex_destroy   pthread_mutex_destroy
++#define __gthread_cond_destroy              pthread_cond_destroy
++#define __gthread_mutex_lock                pthread_mutex_lock
++#define __gthread_mutex_trylock             pthread_mutex_trylock
++#define __gthread_mutex_unlock              pthread_mutex_unlock
++#define __gthread_recursive_mutex_lock      pthread_mutex_lock
++#define __gthread_recursive_mutex_trylock   pthread_mutex_trylock
++#define __gthread_recursive_mutex_unlock    pthread_mutex_unlock
++#define __gthread_cond_signal               pthread_cond_signal
++#define __gthread_cond_broadcast            pthread_cond_broadcast
++#define __gthread_cond_wait                 pthread_cond_wait
++#define __gthread_cond_wait_recursive       pthread_cond_wait
++#define __gthread_join                      pthread_join
++#define __gthread_detach                    pthread_detach
++#define __gthread_equal                     pthread_equal
++#define __gthread_self                      pthread_self
++#define __gthread_yield                     sched_yield
++#define __gthread_key_create                pthread_key_create
++#define __gthread_key_delete                pthread_key_delete
++#define __gthread_getspecific               pthread_getspecific
++#define __gthread_setspecific               pthread_setspecific
++#define __gthread_cond_timedwait            pthread_cond_timedwait
++// These actually aren't implemented in Miosix, so code trying to use these will
++// fail to link, and for now it's the "desired" behaviour (better than failing
++// at runtime, at least). They are used somewhere in libstdc++ too, but as of
++// GCC 14 only in header files wrapping the same functionality in the C++
++// threading classes, they are not used to provide other abstractions.
++#define __gthread_mutex_timedlock           pthread_mutex_timedlock
++#define __gthread_recursive_mutex_timedlock pthread_mutex_timedlock
++
++static inline void __gthread_mutex_init_function(__gthread_mutex_t *__mutex)
++{
++    pthread_mutex_init(__mutex, NULL);
++}
++
++static inline void __gthread_recursive_mutex_init_function(__gthread_recursive_mutex_t *__mutex)
++{
++    // Defined in newlib patches for Miosix
++    __lock_init_recursive(*__mutex);
++}
++
++static inline void __gthread_cond_init_function(__gthread_cond_t *__cond)
++{
++    pthread_cond_init(__cond, NULL);
++}
++
++static inline int __gthread_create(__gthread_t *__thrd, void *(*__func)(void*), void *__args)
++{
++    return pthread_create(__thrd, NULL, __func, __args);
++}
++
++#endif // GCC_GHTR_MIOSIX_H
+diff --git a/libgcc/configure b/libgcc/configure
+index f2bee6d90..cc74f80b8 100755
+--- a/libgcc/configure
++++ b/libgcc/configure
+@@ -5819,6 +5819,7 @@ case $target_thread_file in
+     dce)	thread_header=config/pa/gthr-dce.h ;;
+     gcn)	thread_header=config/gcn/gthr-gcn.h ;;
+     lynx)	thread_header=config/gthr-lynx.h ;;
++    miosix)	thread_header=config/gthr-miosix.h ;;
+     mipssde)	thread_header=config/mips/gthr-mipssde.h ;;
+     posix)	thread_header=gthr-posix.h ;;
+     rtems)	thread_header=config/gthr-rtems.h ;;
+diff --git a/libgcc/unwind-arm-common.inc b/libgcc/unwind-arm-common.inc
+index 38a67889a..d02ef4e7c 100644
+--- a/libgcc/unwind-arm-common.inc
++++ b/libgcc/unwind-arm-common.inc
+@@ -60,14 +60,18 @@ enum __cxa_type_match_result
+     ctm_succeeded_with_ptr_to_base = 2
+   };
+ 
+-void __attribute__((weak)) __cxa_call_unexpected(_Unwind_Control_Block *ucbp);
+-bool __attribute__((weak)) __cxa_begin_cleanup(_Unwind_Control_Block *ucbp);
+-enum __cxa_type_match_result __attribute__((weak)) __cxa_type_match
++// Also declaring function prototypes weak seems to trigger the generation of
++// R_ARM_REL32. This only happens with a test program that does not throw
++// exceptions such as a main.cpp with just a printf() compiled without
++// -fno-exceptions for now, we'll just remove weak
++void /*__attribute__((weak))*/ __cxa_call_unexpected(_Unwind_Control_Block *ucbp);
++bool /*__attribute__((weak))*/ __cxa_begin_cleanup(_Unwind_Control_Block *ucbp);
++enum __cxa_type_match_result /*__attribute__((weak))*/ __cxa_type_match
+   (_Unwind_Control_Block *ucbp, const type_info *rttip,
+    bool is_reference, void **matched_object);
+ 
+-_Unwind_Ptr __attribute__((weak))
+-__gnu_Unwind_Find_exidx (_Unwind_Ptr, int *);
++//_Unwind_Ptr __attribute__((weak))
++//__gnu_Unwind_Find_exidx (_Unwind_Ptr, int *);
+ 
+ #define EXIDX_CANTUNWIND 1
+ #define uint32_highbit (((_uw) 1) << 31)
+@@ -269,6 +273,15 @@ get_eit_entry (_Unwind_Control_Block *ucbp, _uw return_address)
+      instruction itself.  */
+   return_address -= 2;
+ 
++  /*
++   * Apparently checking the address of a weak symbol does not work in Miosix
++   * processes, as we get
++   * libgcc.a(unwind-arm.o): relocation R_ARM_REL32 against external or undefined symbol `__gnu_Unwind_Find_exidx' can not be used when making a PIE executable; recompile with -fPIC
++   * unwind-arm-common.inc:237:(.text+0x138): dangerous relocation: unsupported relocation
++   * Since in Miosix we have __exidx_start|end, just remove this code
++   */
++// TODO: #ifndef _MIOSIX does not work in this context
++#if 0
+   if (__gnu_Unwind_Find_exidx)
+     {
+       eitp = (const __EIT_entry *) __gnu_Unwind_Find_exidx (return_address,
+@@ -305,6 +318,10 @@ get_eit_entry (_Unwind_Control_Block *ucbp, _uw return_address)
+       eitp = &__exidx_start;
+       nrec = &__exidx_end - &__exidx_start;
+     }
++#else // _MIOSIX
++  eitp = &__exidx_start;
++  nrec = &__exidx_end - &__exidx_start;
++#endif
+ 
+   eitp = search_EIT_table (eitp, nrec, return_address);
+ 
+diff --git a/libgcc/unwind-sjlj.c b/libgcc/unwind-sjlj.c
+index 0184a5da4..e75a800f9 100644
+--- a/libgcc/unwind-sjlj.c
++++ b/libgcc/unwind-sjlj.c
+@@ -91,7 +91,14 @@ typedef struct
+   _Unwind_Personality_Fn personality;
+ } _Unwind_FrameState;
+ 
+-
++
++// RATIONALE: _Miosix_set_sjlj_ptr and _Miosix_get_sjlj_ptr make
++// exception handling thread-safe even if Miosix does not support TLS
++// NOTE: C++ uses exception support is in eh_globals.cc, is there any code that
++// triggers these to be called? Otherwise we may either keep them if Miosix
++// will support architectures with sjlj exceptions, or even remove this patch
++#ifndef _MIOSIX
++
+ /* Manage the chain of registered function contexts.  */
+ 
+ /* Single threaded fallback chain.  */
+@@ -163,6 +170,32 @@ _Unwind_SjLj_SetContext (struct SjLj_Function_Context *fc)
+     fc_static = fc;
+ }
+ 
++#else //_MIOSIX
++
++void _Miosix_set_sjlj_ptr(void* ptr);
++void *_Miosix_get_sjlj_ptr();
++
++void
++_Unwind_SjLj_Register (struct SjLj_Function_Context *fc)
++{
++  fc->prev=_Miosix_get_sjlj_ptr();
++  _Miosix_set_sjlj_ptr(fc);
++}
++
++static inline struct SjLj_Function_Context *
++_Unwind_SjLj_GetContext (void)
++{
++  return _Miosix_get_sjlj_ptr();
++}
++
++static inline void
++_Unwind_SjLj_SetContext (struct SjLj_Function_Context *fc)
++{
++  _Miosix_set_sjlj_ptr(fc);
++}
++
++#endif //_MIOSIX
++
+ void
+ _Unwind_SjLj_Unregister (struct SjLj_Function_Context *fc)
+ {
+diff --git a/libgomp/config/posix/omp-lock.h b/libgomp/config/posix/omp-lock.h
+index e51dc271f..9d2b1047a 100644
+--- a/libgomp/config/posix/omp-lock.h
++++ b/libgomp/config/posix/omp-lock.h
+@@ -8,7 +8,9 @@
+    thread than the one that called pthread_mutex_lock.  */
+ 
+ #include <pthread.h>
++#ifndef HAVE_BROKEN_POSIX_SEMAPHORES
+ #include <semaphore.h>
++#endif
+ 
+ typedef pthread_mutex_t omp_lock_25_t;
+ typedef struct { pthread_mutex_t lock; int count; } omp_nest_lock_25_t;
+diff --git a/libgomp/config/posix/sem.h b/libgomp/config/posix/sem.h
+index 54b8476d6..4e8ddafea 100644
+--- a/libgomp/config/posix/sem.h
++++ b/libgomp/config/posix/sem.h
+@@ -38,7 +38,9 @@
+ # pragma GCC visibility push(default)
+ #endif
+ 
++#ifndef HAVE_BROKEN_POSIX_SEMAPHORES
+ #include <semaphore.h>
++#endif
+ 
+ #ifdef HAVE_ATTRIBUTE_VISIBILITY
+ # pragma GCC visibility pop
+diff --git a/libgomp/configure b/libgomp/configure
+index 56cffe796..28598dde4 100755
+--- a/libgomp/configure
++++ b/libgomp/configure
+@@ -15813,6 +15813,11 @@ done
+ case "$host" in
+   *-darwin*)
+ 
++$as_echo "#define HAVE_BROKEN_POSIX_SEMAPHORES 1" >>confdefs.h
++
++    ;;
++  *-miosix*)
++
+ $as_echo "#define HAVE_BROKEN_POSIX_SEMAPHORES 1" >>confdefs.h
+ 
+     ;;
+diff --git a/libgomp/configure.ac b/libgomp/configure.ac
+index 1730c62c7..cd08c8068 100644
+--- a/libgomp/configure.ac
++++ b/libgomp/configure.ac
+@@ -244,6 +244,10 @@ case "$host" in
+     AC_DEFINE(HAVE_BROKEN_POSIX_SEMAPHORES, 1,
+ 	Define if the POSIX Semaphores do not work on your system.)
+     ;;
++  *-miosix*)
++    AC_DEFINE(HAVE_BROKEN_POSIX_SEMAPHORES, 1,
++  	Define if the POSIX Semaphores do not work on your system.)
++    ;;
+ esac
+ 
+ # RTEMS specific checks
+diff --git a/libgomp/configure.tgt b/libgomp/configure.tgt
+index 46af75f97..38c7755aa 100644
+--- a/libgomp/configure.tgt
++++ b/libgomp/configure.tgt
+@@ -172,6 +172,12 @@ case "${target}" in
+ 	config_path="nvptx accel"
+ 	;;
+ 
++  *-miosix-*)
++	config_path="posix"
++	# libgomp uses pthread_exit which on Miosix throws a terminate exception
++	XCFLAGS="${XCFLAGS} -fexceptions"
++	;;
++
+   *-*-rtems*)
+ 	# Use self-contained synchronization objects if provided by Newlib
+ 	if test "x$ac_cv_type_struct__Mutex_Control" = xyes ; then
+diff --git a/libgomp/libgomp.h b/libgomp/libgomp.h
+index 42f324392..85c18615a 100644
+--- a/libgomp/libgomp.h
++++ b/libgomp/libgomp.h
+@@ -974,9 +974,22 @@ static inline struct gomp_thread *gomp_thread (void)
+ }
+ #else
+ extern pthread_key_t gomp_tls_key;
++struct gomp_thread *gomp_initialize_tls_key (void);
+ static inline struct gomp_thread *gomp_thread (void)
+ {
+-  return pthread_getspecific (gomp_tls_key);
++  /* NOTE: if openmp is only used by main(), then initialize_team() takes care
++   * of initializing gomp_tls_key for main() as team leader. However, if the
++   * application spawns a thread using pthread, C11 or C++11 threads and *that*
++   * thread tries to call some OpenMP-parallelized code, no one initialized
++   * gomp_tls_key for that thread, and pthread_getspecific() returns NULL.
++   * Calling gomp_initialize_tls_key() solves the issue.
++   */
++  void *gomp_tls_ptr = pthread_getspecific (gomp_tls_key);
++  if (!gomp_tls_ptr)
++  {
++    gomp_tls_ptr = gomp_initialize_tls_key ();
++  }
++  return gomp_tls_ptr;
+ }
+ #endif
+ 
+diff --git a/libgomp/omp.h.in b/libgomp/omp.h.in
+index acf0756a1..279dcc635 100644
+--- a/libgomp/omp.h.in
++++ b/libgomp/omp.h.in
+@@ -141,7 +141,12 @@ typedef enum omp_allocator_handle_t __GOMP_UINTPTR_T_ENUM
+   __omp_allocator_handle_t_max__ = __UINTPTR_MAX__
+ } omp_allocator_handle_t;
+ 
+-typedef enum omp_alloctrait_key_t
++/*
++ * Patch rationale: force this to be 4 bytes. Somehow when compiled with GCC 14
++ * this is 8 bytes, failing an assertion in libgomp_f.h:omp_check_defines()
++ */
++typedef uint32_t omp_alloctrait_key_t;
++typedef enum _omp_alloctrait_key_t
+ {
+   omp_atk_sync_hint = 1,
+   omp_atk_alignment = 2,
+@@ -151,7 +156,7 @@ typedef enum omp_alloctrait_key_t
+   omp_atk_fb_data = 6,
+   omp_atk_pinned = 7,
+   omp_atk_partition = 8
+-} omp_alloctrait_key_t;
++} _omp_alloctrait_key_t;
+ 
+ typedef enum omp_alloctrait_value_t
+ {
+diff --git a/libgomp/team.c b/libgomp/team.c
+index 5282a3133..f42e834d9 100644
+--- a/libgomp/team.c
++++ b/libgomp/team.c
+@@ -43,6 +43,20 @@ pthread_key_t gomp_thread_destructor;
+ __thread struct gomp_thread gomp_tls_data;
+ #else
+ pthread_key_t gomp_tls_key;
++
++struct gomp_thread *gomp_initialize_tls_key (void)
++{
++	struct gomp_thread *gomp_tls_ptr = malloc (sizeof (struct gomp_thread));
++	if (!gomp_tls_ptr) gomp_fatal ("Out of memory");
++	memset (gomp_tls_ptr, 0, sizeof (struct gomp_thread));
++	pthread_setspecific (gomp_tls_key, gomp_tls_ptr);
++	return gomp_tls_ptr;
++}
++
++void gomp_delete_tls_key (void* ptr)
++{
++	free (ptr);
++}
+ #endif
+ 
+ 
+@@ -78,8 +92,7 @@ gomp_thread_start (void *xdata)
+ #if defined HAVE_TLS || defined USE_EMUTLS
+   thr = &gomp_tls_data;
+ #else
+-  struct gomp_thread local_thr;
+-  thr = &local_thr;
++  thr = gomp_initialize_tls_key ();
+ #endif
+   gomp_sem_init (&thr->release, 0);
+ 
+@@ -95,9 +108,6 @@ gomp_thread_start (void *xdata)
+ #ifdef GOMP_NEEDS_THREAD_HANDLE
+   thr->handle = data->handle;
+ #endif
+-#if !(defined HAVE_TLS || defined USE_EMUTLS)
+-  pthread_setspecific (gomp_tls_key, thr);
+-#endif
+ 
+   thr->ts.team->ordered_release[thr->ts.team_id] = &thr->release;
+ 
+@@ -262,9 +272,13 @@ gomp_free_pool_helper (void *thread_pool)
+ /* Free a thread pool and release its threads. */
+ 
+ void
+-gomp_free_thread (void *arg __attribute__((unused)))
++gomp_free_thread (void *arg)
+ {
+-  struct gomp_thread *thr = gomp_thread ();
++  // NOTE: we cannot call gomp_thread () here as it calls pthread_getspecific ()
++  // and the POSIX semantics require the pthread_key value to be set to NULL
++  // before calling the destructor. We must get the struct gomp_thread pointer
++  // from the arg parameter!
++  struct gomp_thread *thr = (struct gomp_thread *) arg;
+   struct gomp_thread_pool *pool = thr->thread_pool;
+   if (pool)
+     {
+@@ -1022,10 +1036,8 @@ static void __attribute__((constructor))
+ initialize_team (void)
+ {
+ #if !defined HAVE_TLS && !defined USE_EMUTLS
+-  static struct gomp_thread initial_thread_tls_data;
+-
+-  pthread_key_create (&gomp_tls_key, NULL);
+-  pthread_setspecific (gomp_tls_key, &initial_thread_tls_data);
++  pthread_key_create (&gomp_tls_key, gomp_delete_tls_key);
++  gomp_initialize_tls_key ();
+ #endif
+ 
+   if (pthread_key_create (&gomp_thread_destructor, gomp_free_thread) != 0)
+diff --git a/libstdc++-v3/configure b/libstdc++-v3/configure
+index bc9dce5e2..48486f983 100755
+--- a/libstdc++-v3/configure
++++ b/libstdc++-v3/configure
+@@ -16384,6 +16384,7 @@ case $target_thread_file in
+     dce)	thread_header=config/pa/gthr-dce.h ;;
+     gcn)	thread_header=config/gcn/gthr-gcn.h ;;
+     lynx)	thread_header=config/gthr-lynx.h ;;
++    miosix)	thread_header=config/gthr-miosix.h ;;
+     mipssde)	thread_header=config/mips/gthr-mipssde.h ;;
+     posix)	thread_header=gthr-posix.h ;;
+     rtems)	thread_header=config/gthr-rtems.h ;;
+@@ -21579,6 +21580,23 @@ fi
+         ac_has_sched_yield=yes
+     esac
+ 
++    # apparently the miosix in arm-miosix-eabi is ${target_vendor}
++    case "${target_vendor}" in
++        miosix*)
++        # Rationale: src/c++11/chrono.cc src/c++11/thread.cc include/std/thread
++        # need to target the best syscalls for querying the time and sleeping,
++        # which are
++        # clock_gettime(CLOCK_REALTIME, &tp);  //starting Jan 1st, 1970
++        # clock_gettime(CLOCK_MONOTONIC, &tp); //starting @ boot
++        # clock_nanosleep(CLOCK_MONOTONIC, 0, &__ts, &__ts);
++        # clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &__ts, &__ts);
++        ac_has_clock_realtime=yes
++        ac_has_clock_monotonic=yes
++        ac_has_nanosleep=yes
++        ac_has_sched_yield=yes
++        ;;
++    esac
++
+   elif test x"$enable_libstdcxx_time" != x"no"; then
+ 
+     if test x"$enable_libstdcxx_time" = x"rt"; then
+diff --git a/libstdc++-v3/include/bits/fstream.tcc b/libstdc++-v3/include/bits/fstream.tcc
+index 99aa296b8..5964bbc1e 100644
+--- a/libstdc++-v3/include/bits/fstream.tcc
++++ b/libstdc++-v3/include/bits/fstream.tcc
+@@ -85,7 +85,12 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
+     basic_filebuf<_CharT, _Traits>::
+     basic_filebuf() : __streambuf_type(), _M_lock(), _M_file(&_M_lock),
+     _M_mode(ios_base::openmode(0)), _M_state_beg(), _M_state_cur(),
+-    _M_state_last(), _M_buf(0), _M_buf_size(_GLIBCXX_BUFSIZ),
++    _M_state_last(), _M_buf(0),
++#ifndef _MIOSIX
++	_M_buf_size(_GLIBCXX_BUFSIZ),
++#else
++	_M_buf_size(_GLIBCXX_BUFSIZ + 1), // By TFT: +1 to optimize reads/writes
++#endif
+     _M_buf_allocated(false), _M_reading(false), _M_writing(false), _M_pback(), 
+     _M_pback_cur_save(0), _M_pback_end_save(0), _M_pback_init(false),
+     _M_codecvt(0), _M_ext_buf(0), _M_ext_buf_size(0), _M_ext_next(0),
+diff --git a/libstdc++-v3/include/bits/std_mutex.h b/libstdc++-v3/include/bits/std_mutex.h
+index 7ef33fe5d..80c0e46be 100644
+--- a/libstdc++-v3/include/bits/std_mutex.h
++++ b/libstdc++-v3/include/bits/std_mutex.h
+@@ -175,19 +175,40 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
+       __glibcxx_assert(__e == 0);
+     }
+ 
++    // Patch set ID: time-functions-optimization
++    // Patch rationale: use return value to check for timeout
++#ifdef _MIOSIX
++    int
++    wait_until(mutex& __m, timespec& __abs_time)
++    {
++      return __gthread_cond_timedwait(&_M_cond, __m.native_handle(), &__abs_time);
++    }
++#else //_MIOSIX
+     void
+     wait_until(mutex& __m, timespec& __abs_time)
+     {
+       __gthread_cond_timedwait(&_M_cond, __m.native_handle(), &__abs_time);
+     }
++#endif //_MIOSIX
+ 
+ #ifdef _GLIBCXX_USE_PTHREAD_COND_CLOCKWAIT
++    // Patch set ID: time-functions-optimization
++    // Patch rationale: use return value to check for timeout
++#ifdef _MIOSIX
++    int
++    wait_until(mutex& __m, clockid_t __clock, timespec& __abs_time)
++    {
++      return pthread_cond_clockwait(&_M_cond, __m.native_handle(), __clock,
++			     &__abs_time);
++    }
++#else //_MIOSIX
+     void
+     wait_until(mutex& __m, clockid_t __clock, timespec& __abs_time)
+     {
+       pthread_cond_clockwait(&_M_cond, __m.native_handle(), __clock,
+ 			     &__abs_time);
+     }
++#endif //_MIOSIX
+ #endif
+ 
+     void
+diff --git a/libstdc++-v3/include/bits/stl_tree.h b/libstdc++-v3/include/bits/stl_tree.h
+index a7781b721..af193a407 100644
+--- a/libstdc++-v3/include/bits/stl_tree.h
++++ b/libstdc++-v3/include/bits/stl_tree.h
+@@ -1546,7 +1546,18 @@ namespace __rb_tree
+ 	return _M_copy<__as_lvalue>(__x, __an);
+       }
+ 
+-      void
++      /*
++       * Patch rationale: this function is not marked inline, for a reason I
++       * would add. However, in GCC 15.2.0 compiling with -O2 this function gets
++       * inlined. But this is a recursive function, so its implementation gets
++       * inlined again and again until after 8 times the compiler finally gives
++       * up. This excessive inlining causes every use of std::map to code bloat.
++       * This issue did not happen in GCC 9.2.0.
++       * For future compiler versions consider removing this patch if a
++       * disassembly of _M_erase shows assembly code matching one instance of
++       * the source code, not multiple ones...
++       */
++      void __attribute__((noinline))
+       _M_erase(_Node_ptr __x);
+ 
+       _Base_ptr
+diff --git a/libstdc++-v3/include/bits/this_thread_sleep.h b/libstdc++-v3/include/bits/this_thread_sleep.h
+index 205252776..9b523f505 100644
+--- a/libstdc++-v3/include/bits/this_thread_sleep.h
++++ b/libstdc++-v3/include/bits/this_thread_sleep.h
+@@ -69,8 +69,15 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
+ 
+ 	struct timespec __ts = chrono::__to_timeout_timespec(__rtime);
+ #ifdef _GLIBCXX_USE_NANOSLEEP
++	  // Patch set ID: time-functions-optimization
++	  // Patch rationale: use Miosix preferred sleep function
++#ifdef _MIOSIX
++	while (::clock_nanosleep(CLOCK_MONOTONIC, 0, &__ts, &__ts) == -1 && errno == EINTR)
++	  { }
++#else // _MIOSIX
+ 	while (::nanosleep(&__ts, &__ts) == -1 && errno == EINTR)
+ 	  { }
++#endif //_MIOSIX
+ #else
+ 	using chrono::seconds;
+ 	using chrono::nanoseconds;
+@@ -87,6 +94,21 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
+ #if __cplusplus > 201703L
+ 	static_assert(chrono::is_clock_v<_Clock>);
+ #endif
++	  // Patch set ID: time-functions-optimization
++	  // Patch rationale: do not add skew by converting absolute sleep to relative
++#ifdef _MIOSIX
++	auto __rtime = __atime.time_since_epoch();
++	auto __s = chrono::duration_cast<chrono::seconds>(__rtime);
++	auto __ns = chrono::duration_cast<chrono::nanoseconds>(__rtime - __s);
++	__gthread_time_t __ts =
++	  {
++	    static_cast<std::time_t>(__s.count()),
++	    static_cast<long>(__ns.count())
++	  };
++	clockid_t __clk = _Clock::is_steady ? CLOCK_MONOTONIC : CLOCK_REALTIME;
++	while (::clock_nanosleep(__clk, TIMER_ABSTIME, &__ts, &__ts) == -1 && errno == EINTR)
++	  { }
++#else // _MIOSIX
+ 	auto __now = _Clock::now();
+ 	if (_Clock::is_steady)
+ 	  {
+@@ -99,6 +121,7 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
+ 	    sleep_for(__atime - __now);
+ 	    __now = _Clock::now();
+ 	  }
++#endif // _MIOSIX
+       }
+ #endif // ! NO_SLEEP
+   } // namespace this_thread
+diff --git a/libstdc++-v3/include/bits/version.def b/libstdc++-v3/include/bits/version.def
+index 44099eccd..43a245681 100644
+--- a/libstdc++-v3/include/bits/version.def
++++ b/libstdc++-v3/include/bits/version.def
+@@ -607,19 +607,22 @@ ftms = {
+   };
+ };
+ 
++//Patch set ID: chrono-build-fix
++//Patch rationale: Use extra_cond instead of cxx11abi to also define 201907 for old-ABI-only builds.
++//Backported from upstream, remove for future GCC versions.
+ ftms = {
+   name = chrono;
+   values = {
+     v = 202306;
+     cxxmin = 26;
+     hosted = yes;
+-    cxx11abi = yes;
++    extra_cond = "_GLIBCXX_USE_CXX11_ABI || !_GLIBCXX_USE_DUAL_ABI";
+   };
+   values = {
+     v = 201907;
+     cxxmin = 20;
+     hosted = yes;
+-    cxx11abi = yes; // std::chrono::tzdb requires cxx11 std::string
++    extra_cond = "_GLIBCXX_USE_CXX11_ABI || !_GLIBCXX_USE_DUAL_ABI";
+   };
+   values = {
+     v = 201611;
+diff --git a/libstdc++-v3/include/bits/version.h b/libstdc++-v3/include/bits/version.h
+index 68f9a5d0b..ccc546239 100644
+--- a/libstdc++-v3/include/bits/version.h
++++ b/libstdc++-v3/include/bits/version.h
+@@ -680,13 +680,15 @@
+ #endif /* !defined(__cpp_lib_boyer_moore_searcher) */
+ #undef __glibcxx_want_boyer_moore_searcher
+ 
++//Patch set ID: chrono-build-fix
++//Patch rationale: regenerate version.h (see version.def)
+ #if !defined(__cpp_lib_chrono)
+-# if (__cplusplus >  202302L) && _GLIBCXX_USE_CXX11_ABI && _GLIBCXX_HOSTED
++# if (__cplusplus >  202302L) && _GLIBCXX_HOSTED && (_GLIBCXX_USE_CXX11_ABI || !_GLIBCXX_USE_DUAL_ABI)
+ #  define __glibcxx_chrono 202306L
+ #  if defined(__glibcxx_want_all) || defined(__glibcxx_want_chrono)
+ #   define __cpp_lib_chrono 202306L
+ #  endif
+-# elif (__cplusplus >= 202002L) && _GLIBCXX_USE_CXX11_ABI && _GLIBCXX_HOSTED
++# elif (__cplusplus >= 202002L) && _GLIBCXX_HOSTED && (_GLIBCXX_USE_CXX11_ABI || !_GLIBCXX_USE_DUAL_ABI)
+ #  define __glibcxx_chrono 201907L
+ #  if defined(__glibcxx_want_all) || defined(__glibcxx_want_chrono)
+ #   define __cpp_lib_chrono 201907L
+diff --git a/libstdc++-v3/include/std/condition_variable b/libstdc++-v3/include/std/condition_variable
+index ce995ed57..b7adf96a7 100644
+--- a/libstdc++-v3/include/std/condition_variable
++++ b/libstdc++-v3/include/std/condition_variable
+@@ -84,12 +84,29 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
+   public:
+     typedef __gthread_cond_t* 		native_handle_type;
+ 
++/*
++ * Patch set ID: inline-condvar
++ */
++#ifndef _MIOSIX
++
+     condition_variable() noexcept;
+     ~condition_variable() noexcept;
+ 
++#else //_MIOSIX
++
++    condition_variable() noexcept = default;
++    ~condition_variable() noexcept = default;
++
++#endif //_MIOSIX
++
+     condition_variable(const condition_variable&) = delete;
+     condition_variable& operator=(const condition_variable&) = delete;
+ 
++/*
++ * Patch set ID: inline-condvar
++ */
++#ifndef _MIOSIX
++
+     void
+     notify_one() noexcept;
+ 
+@@ -99,6 +116,28 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
+     void
+     wait(unique_lock<mutex>& __lock);
+ 
++#else // _MIOSIX
++
++    void
++    notify_one() noexcept
++    {
++      _M_cond.notify_one();
++    }
++
++    void
++    notify_all() noexcept
++    {
++      _M_cond.notify_all();
++    }
++
++    void
++    wait(unique_lock<mutex>& __lock)
++    {
++      _M_cond.wait(*__lock.mutex());
++    }
++
++#endif // _MIOSIX
++
+     template<typename _Predicate>
+       void
+       wait(unique_lock<mutex>& __lock, _Predicate __p)
+@@ -196,10 +235,17 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
+ 			const chrono::time_point<steady_clock, _Dur>& __atime)
+       {
+ 	__gthread_time_t __ts = chrono::__to_timeout_gthread_time_t(__atime);
++	// Patch set ID: time-functions-optimization
++	// Patch rationale: use return value to check for timeout
++#ifdef _MIOSIX
++	return _M_cond.wait_until(*__lock.mutex(), CLOCK_MONOTONIC, __ts) == ETIMEDOUT
++		? cv_status::timeout : cv_status::no_timeout;
++#else //_MIOSIX
+ 	_M_cond.wait_until(*__lock.mutex(), CLOCK_MONOTONIC, __ts);
+ 
+ 	return (steady_clock::now() < __atime
+ 		? cv_status::no_timeout : cv_status::timeout);
++#endif //_MIOSIX
+       }
+ #endif
+ 
+@@ -209,10 +255,17 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
+ 			const chrono::time_point<system_clock, _Dur>& __atime)
+       {
+ 	__gthread_time_t __ts = chrono::__to_timeout_gthread_time_t(__atime);
++	// Patch set ID: time-functions-optimization
++	// Patch rationale: use return value to check for timeout
++#ifdef _MIOSIX
++	return _M_cond.wait_until(*__lock.mutex(), __ts) == ETIMEDOUT
++		? cv_status::timeout : cv_status::no_timeout;
++#else //_MIOSIX
+ 	_M_cond.wait_until(*__lock.mutex(), __ts);
+ 
+ 	return (system_clock::now() < __atime
+ 		? cv_status::no_timeout : cv_status::timeout);
++#endif //_MIOSIX
+       }
+   };
+ 
+diff --git a/libstdc++-v3/libsupc++/eh_alloc.cc b/libstdc++-v3/libsupc++/eh_alloc.cc
+index aab2aec7f..25c5030de 100644
+--- a/libstdc++-v3/libsupc++/eh_alloc.cc
++++ b/libstdc++-v3/libsupc++/eh_alloc.cc
+@@ -186,6 +186,18 @@ namespace
+ 
+   pool::pool() noexcept
+     {
++#ifdef _MIOSIX
++      // When compiling for Miosix, we lock the mutex. Not because we need it
++      // to protect against concurrent access, but to exercise this code path.
++      // Depending on how the kernel is compiled, the first attempt to lock a
++      // mutex in Miosix may allocate memory using malloc.
++      // That's a problem because the whole purpose of the emergency pool is to
++      // successfully allocate an exception even if the heap is full and malloc
++      // returns NULL, so if the first time we lock this mutex is after the heap
++      // is already full, and the lock fails, this kind of defeats the purpose..
++      __scoped_lock sentry(emergency_mutex);
++#endif
++
+ #ifndef _GLIBCXX_EH_POOL_STATIC
+       int obj_size = EMERGENCY_OBJ_SIZE;
+       int obj_count = EMERGENCY_OBJ_COUNT;
+diff --git a/libstdc++-v3/libsupc++/eh_globals.cc b/libstdc++-v3/libsupc++/eh_globals.cc
+index 5930eeced..bfbbdf231 100644
+--- a/libstdc++-v3/libsupc++/eh_globals.cc
++++ b/libstdc++-v3/libsupc++/eh_globals.cc
+@@ -41,6 +41,11 @@ extern "C" void free(void *);
+ 
+ using namespace __cxxabiv1;
+ 
++// RATIONALE: __cxa_get_globals() and __cxa_get_globals_fast() have been moved
++// to libmiosix.a (kernel) / libsyscalls.a (userspace) since the __cxa_eh_globals
++// struct needs to be provided per-thread but Miosix does not support TLS
++#ifndef _MIOSIX
++
+ #if _GLIBCXX_HAVE_TLS
+ 
+ namespace
+@@ -174,3 +179,5 @@ __cxxabiv1::__cxa_get_globals() _GLIBCXX_NOTHROW
+ #endif
+ 
+ #endif
++
++#endif //_MIOSIX
+diff --git a/libstdc++-v3/libsupc++/guard.cc b/libstdc++-v3/libsupc++/guard.cc
+index cf86f83ac..012547571 100644
+--- a/libstdc++-v3/libsupc++/guard.cc
++++ b/libstdc++-v3/libsupc++/guard.cc
+@@ -55,6 +55,13 @@ __cxa_guard_abort (__guard* g) _GLIBCXX_NOTHROW
+ 
+ }  // namespace __cxxabiv1
+ 
++#elif defined(_MIOSIX)
++
++// RATIONALE: __cxa_guard_[acquire|release|abort] have been moved to
++// libmiosix.a (kernel) / libsyscalls.a (userspace) as static object
++// initialization can occur also before the kernel is started, therefore at a
++// time when using pthread_mutex and pthread_cond is unsafe.
++
+ #else // __USING_MCFGTHREAD__
+ 
+ #include <ext/atomicity.h>
+diff --git a/libstdc++-v3/libsupc++/vterminate.cc b/libstdc++-v3/libsupc++/vterminate.cc
+index ad4898473..6409c6012 100644
+--- a/libstdc++-v3/libsupc++/vterminate.cc
++++ b/libstdc++-v3/libsupc++/vterminate.cc
+@@ -31,6 +31,8 @@
+ #include <cxxabi.h>
+ # include <cstdio>
+ 
++#include <unistd.h>
++
+ using namespace std;
+ using namespace abi;
+ 
+@@ -38,6 +40,16 @@ namespace __gnu_cxx
+ {
+ _GLIBCXX_BEGIN_NAMESPACE_VERSION
+ 
++  // XXX: having trouble overriding weak functions in Miosix processes,
++  // and this function is increasing code size significantly, replacing it
++  void __verbose_terminate_handler()
++  {
++      write(1,"terminate called\n",17);
++      _exit(1);
++  }
++
++#if 0
++
+   // A replacement for the standard terminate_handler which prints
+   // more information about the terminating exception (if any) on
+   // stderr.
+@@ -95,6 +107,8 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
+     abort();
+   }
+ 
++#endif
++
+ _GLIBCXX_END_NAMESPACE_VERSION
+ } // namespace
+ 
+diff --git a/libstdc++-v3/src/c++11/condition_variable.cc b/libstdc++-v3/src/c++11/condition_variable.cc
+index 75a5becd4..3554d46b4 100644
+--- a/libstdc++-v3/src/c++11/condition_variable.cc
++++ b/libstdc++-v3/src/c++11/condition_variable.cc
+@@ -31,6 +31,15 @@ namespace std _GLIBCXX_VISIBILITY(default)
+ {
+ _GLIBCXX_BEGIN_NAMESPACE_VERSION
+ 
++/*
++ * Patch set ID: inline-condvar
++ * Patch rationale: this patch used to be needed to avoid pulling in exceptions
++ * when compiling with -fno-exceptions, but now we switched to having a separate
++ * multilib for that. We kept this patch just because condition_variable methods
++ * are so simple that inlining them will make condition_variable faster.
++ */
++#ifndef _MIOSIX
++
+   condition_variable::condition_variable() noexcept = default;
+ 
+   condition_variable::~condition_variable() noexcept = default;
+@@ -53,6 +62,8 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
+     _M_cond.notify_all();
+   }
+ 
++#endif //_MIOSIX
++
+   extern void
+   __at_thread_exit(__at_thread_exit_elt*);
+ 
+diff --git a/libstdc++-v3/src/c++11/functexcept.cc b/libstdc++-v3/src/c++11/functexcept.cc
+index 40dadd2ae..6eeec22c4 100644
+--- a/libstdc++-v3/src/c++11/functexcept.cc
++++ b/libstdc++-v3/src/c++11/functexcept.cc
+@@ -87,7 +87,14 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
+   void
+   __throw_out_of_range_fmt(const char* __fmt, ...)
+   {
+-#if _GLIBCXX_HOSTED && _GLIBCXX_VERBOSE && __cpp_exceptions
++    // Miosix applications usually run with tiny stacks of a few KB, doing an
++    // alloca of 512+ bytes is almost guaranteed to cause stack overflow.
++    // The fact that this allocation happens if an exception is thrown (which
++    // should normally not occur) only makes testing and sizing stacks harder.
++    // For this reason, even if it is a nice feature, we've decided to not
++    // expand formats. Users will get a strange exception with %zu or other
++    // format strings in it, but at least no stack overflow.
++#if _GLIBCXX_HOSTED && _GLIBCXX_VERBOSE && __cpp_exceptions && !defined(_MIOSIX)
+     const size_t __len = __builtin_strlen(__fmt);
+     // We expect at most 2 numbers, and 1 short string. The additional
+     // 512 bytes should provide more than enough space for expansion.
+diff --git a/libstdc++-v3/src/c++11/system_error.cc b/libstdc++-v3/src/c++11/system_error.cc
+index 851f51acd..adaacf172 100644
+--- a/libstdc++-v3/src/c++11/system_error.cc
++++ b/libstdc++-v3/src/c++11/system_error.cc
+@@ -597,7 +597,16 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
+   void
+   __throw_system_error(int __i __attribute__((unused)))
+   {
++    // Patch rationale: a simple main instantiating an std::mutex and calling
++    // lock() increases code size by >6KB compared to an empty main.
++    // The issue was traced to system_error pulling in strerror to get fancy
++    // error messages. To save code size we throw runtime_error instead.
++    // TODO: maybe print the error code __i, but somehow without pulling in sprintf?
++#ifdef _MIOSIX
++    _GLIBCXX_THROW_OR_ABORT(runtime_error("System error"));
++#else
+     _GLIBCXX_THROW_OR_ABORT(system_error(__i, generic_category_instance.obj));
++#endif
+   }
+ 
+   error_category::~error_category() = default;
+diff --git a/libstdc++-v3/src/c++17/fs_ops.cc b/libstdc++-v3/src/c++17/fs_ops.cc
+index 454962c75..ccc28cf0a 100644
+--- a/libstdc++-v3/src/c++17/fs_ops.cc
++++ b/libstdc++-v3/src/c++17/fs_ops.cc
+@@ -745,7 +745,11 @@ fs::current_path(error_code& ec)
+   else
+     ec.assign(errno, std::generic_category());
+ #else
+-#ifdef _PC_PATH_MAX
++#ifdef _MIOSIX
++  //1. On Miosix avoid pathconf
++  //2. PATH_MAX is big (512) and memory is scarce, so try a smaller buffer first
++  size_t size = PATH_MAX/4;
++#elif defined(_PC_PATH_MAX)
+   long path_max = pathconf(".", _PC_PATH_MAX);
+   size_t size;
+   if (path_max == -1)
+diff --git a/libstdc++-v3/src/c++20/atomic.cc b/libstdc++-v3/src/c++20/atomic.cc
+index 3e02f437d..573568702 100644
+--- a/libstdc++-v3/src/c++20/atomic.cc
++++ b/libstdc++-v3/src/c++20/atomic.cc
+@@ -289,9 +289,15 @@ namespace
+   // The state used by atomic waiting and notifying functions.
+   struct __waitable_state
+   {
++#ifndef _MIOSIX
+     // Don't use std::hardware_destructive_interference_size here because we
+     // don't want the layout of library types to depend on compiler options.
+     static constexpr auto _S_align = 64;
++#else
++    //Patch rationale: Miosix runs on microcontrollers which have no cache
++    //alignment issues, but there is very little RAM: reduce RAM usage
++    static constexpr auto _S_align = 1;
++#endif
+ 
+     // Count of threads blocked waiting on this state.
+     alignas(_S_align) __platform_wait_t _M_waiters = 0;
+@@ -337,7 +343,12 @@ namespace
+     static __waitable_state&
+     _S_state_for(const void* __addr) noexcept
+     {
++#ifndef _MIOSIX
+       constexpr __UINTPTR_TYPE__ __ct = 16;
++#else
++      //Patch rationale: Miosix runs on microcontrollers: reduce RAM usage
++      constexpr __UINTPTR_TYPE__ __ct = 1;
++#endif
+       static __waitable_state __w[__ct];
+       auto __key = ((__UINTPTR_TYPE__)__addr >> 2) % __ct;
+       return __w[__key];
+@@ -607,6 +618,16 @@ __cond_wait_until(__condvar& __cv, mutex& __mx,
+ {
+   __gthread_time_t __ts = chrono::__to_timeout_gthread_time_t(__atime);
+ 
++  // Patch set ID: time-functions-optimization
++// Patch rationale: use return value to check for timeout
++#ifdef _MIOSIX
++#ifdef _GLIBCXX_USE_PTHREAD_COND_CLOCKWAIT
++  if constexpr (is_same_v<chrono::steady_clock, __wait_clock_t>)
++    return __cv.wait_until(__mx, CLOCK_MONOTONIC, __ts) != ETIMEDOUT;
++  else
++#endif
++  return __cv.wait_until(__mx, __ts) != ETIMEDOUT;
++#else //_MIOSIX
+ #ifdef _GLIBCXX_USE_PTHREAD_COND_CLOCKWAIT
+   if constexpr (is_same_v<chrono::steady_clock, __wait_clock_t>)
+     __cv.wait_until(__mx, CLOCK_MONOTONIC, __ts);
+@@ -614,6 +635,7 @@ __cond_wait_until(__condvar& __cv, mutex& __mx,
+ #endif
+     __cv.wait_until(__mx, __ts);
+   return __wait_clock_t::now() < __atime;
++#endif //_MIOSIX
+ }
+ #endif // ! HAVE_PLATFORM_WAIT
+ } // namespace
