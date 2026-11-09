@@ -32,7 +32,7 @@ int main(int argc, char *argv[])
 {
     if(argc<4)
     {
-        cerr<<"Miosix buildromfs utility v2.00"<<endl
+        cerr<<"Miosix buildromfs utility v2.01"<<endl
             <<"use: buildromfs <target file> --from-directory <source directory>"<<endl;
         return 1;
     }
@@ -40,7 +40,11 @@ int main(int argc, char *argv[])
     // Build the tree of files and directories that compose the image
     string mode=argv[2];
     FilesystemEntry root;
-    int uidGidOverride=0; //TODO: for now force all uid and gid to 0 (root)
+    #if defined(WIN32) || defined(_WIN32) || defined(_MSC_VER) || defined(_WIN64) || defined(__MINGW64__) || defined(__MINGW32__)
+    int uidGidOverride=0; //TODO: for now  on windows force all uid and gid to 0 (root)
+    #else
+    int uidGidOverride=-1;
+    #endif
     if(mode=="--from-directory")
     {
         if(int result=buildFromDir(root,argv[3],uidGidOverride)!=0) return result;
