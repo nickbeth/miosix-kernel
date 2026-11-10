@@ -1814,26 +1814,6 @@ ssize_t recvmsg(int fd, struct msghdr *message, int flags)
     #endif //WITH_NETWORKING
 }
 
-uint32_t htonl(uint32_t hostlong)
-{
-  return toBigEndian32(hostlong);
-}
-
-uint16_t htons(uint16_t hostshort)
-{
-  return toBigEndian16(hostshort);
-}
-
-uint32_t ntohl(uint32_t netlong)
-{
-  return fromBigEndian32(netlong);
-}
-
-uint16_t ntohs(uint16_t netshort)
-{
-  return fromBigEndian16(netshort);
-}
-
 #ifdef __cplusplus
 }
 #endif
