@@ -43,8 +43,8 @@ CXXFLAGS  = -qkernelspace -D_MIOSIX_BOARDNAME=\"$(OPT_BOARD)\"                 \
 LFLAGS    = -qkernelspace $(BOARD_LFLAGS) $(CPU_FLAGS) $(CHIP_LFLAGS)      \
             -Wl,-Map,main.map -Wl,-T$(KPATH)/$(BOARD_INC)/$(LINKER_SCRIPT) \
             $(OPT_EXCEPT) $(OPT_OPTIMIZATION) -nostdlib $(LFLAGS_BASE)
-STDLIBS  := -lmiosix -lstdc++ -lc -lm -lgcc -latomic -lmiosix_network
-LINK_LIBS = $(LIBS) -L$(KPATH) -L$(KPATH)/network \
+STDLIBS  := -lmiosix -lstdc++ -lc -lm -lgcc -latomic
+LINK_LIBS = $(LIBS) -L$(KPATH) \
             -Wl,--start-group $(STDLIBS) -Wl,--end-group
 TOOLS_DIR := $(KPATH)/tools
 
@@ -53,7 +53,7 @@ SZ := perl $(TOOLS_DIR)/miosix_size.pl --prefix=$(PREFIX)
 
 OBJ ?= $(addsuffix .o, $(basename $(SRC)))
 
-SUBDIRS := $(KPATH) $(KPATH)/network
+SUBDIRS := $(KPATH)
 
 # Starting from Miosix 3, we compile the kernel with the -qkernelspace option
 # that was not present in GCC patches before 15.2.0mp4.0, so when using an

@@ -61,6 +61,10 @@ util/lcd44780.cpp
 ## architecture/board is selected in config/Makefile.inc
 SRC += $(BOARD_SRC) $(CHIP_SRC)
 
+## Build the networking stack as part of the kernel library.
+include $(KPATH)/network/Makefile.inc
+SRC += $(NET_SRC)
+
 CFLAGS   += -DCOMPILING_MIOSIX
 CXXFLAGS += -DCOMPILING_MIOSIX
 
