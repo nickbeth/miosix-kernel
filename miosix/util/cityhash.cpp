@@ -1,9 +1,10 @@
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 
 namespace {
 
-constexpr uint32_t fetch32(const uint8_t *p) {
+uint32_t fetch32(const uint8_t *p) {
     // Unaligned load of a 32-bit value
     uint32_t result;
     std::memcpy(&result, p, sizeof(result));

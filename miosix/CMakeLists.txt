@@ -187,10 +187,13 @@ set(MIOSIX_KERNEL_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/filesystem/littlefs/lfs.c
     ${CMAKE_CURRENT_SOURCE_DIR}/filesystem/littlefs/lfs_util.c
     ${CMAKE_CURRENT_SOURCE_DIR}/filesystem/romfs/romfs.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/filesystem/socket/socket.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/filesystem/socket/socket_impl.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/kercalls/libc_integration.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/kercalls/libstdcpp_integration.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/e20/e20.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/e20/unmember.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/util/cityhash.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/util.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/unicode.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/version.cpp
@@ -271,3 +274,6 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         ${MIOSIX_GCC_PATH}/lib/gcc/arm-miosix-eabi/15.2.0/${MIOSIX_MULTILIB_PATH}
     )
 endif()
+
+# Add network stack subdirectory
+add_subdirectory(network)

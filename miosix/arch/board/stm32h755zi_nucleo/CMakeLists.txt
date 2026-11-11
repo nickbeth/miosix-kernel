@@ -20,6 +20,9 @@ set(MIOSIX_DEFAULT_LINKER_SCRIPT unikernel.ld)
 
 # Select architecture specific files
 set(MIOSIX_BOARD_SRC
+    ${CMAKE_CURRENT_SOURCE_DIR}/arch/drivers/eth/stm32_eth_h7.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/arch/drivers/eth/stm32_phy_h7.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/arch/drivers/stm32_uid.cpp
     ${MIOSIX_BOARD_INC}/boot.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/arch/drivers/stm32_hardware_rng.cpp
     ${MIOSIX_BOARD_INC}/interfaces-impl/bsp.cpp

@@ -45,7 +45,6 @@
 
 #include <atomic>
 #include <bit>
-#include <memory>
 
 namespace miosix::network {
 namespace {
