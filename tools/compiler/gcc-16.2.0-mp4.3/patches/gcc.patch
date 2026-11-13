@@ -543,10 +543,10 @@ index 000000000..ddb32efc5
 +			mthumb/march.$(ARCH)/mfloat-abi.soft/fno-exceptions=mthumb/march.$(ARCH)/fno-exceptions)
 diff --git a/gcc/config/miosix.h b/gcc/config/miosix.h
 new file mode 100644
-index 000000000..901370e60
+index 000000000..ecfda6ee1
 --- /dev/null
 +++ b/gcc/config/miosix.h
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,135 @@
 +/* Target definitions for the Miosix RTOS. */
 +
 +/* RATIONALE: adding builtin_define to always define _MIOSIX
@@ -562,7 +562,7 @@ index 000000000..901370e60
 +      TARGET_BPABI_CPP_BUILTINS ();                 \
 +      builtin_define ("_MIOSIX");                   \
 +      builtin_define ("_MIOSIX_GCC_PATCH_MAJOR=4"); \
-+      builtin_define ("_MIOSIX_GCC_PATCH_MINOR=2"); \
++      builtin_define ("_MIOSIX_GCC_PATCH_MINOR=3"); \
 +      builtin_assert ("system=miosix");             \
 +    }                                               \
 +  while (0)
@@ -570,6 +570,23 @@ index 000000000..901370e60
 +/* Force -fpie -msingle-pic-base for Miosix process object files */
 +#undef  OS_CC1_SPEC
 +#define OS_CC1_SPEC "%{!qkernelspace:-fpie -msingle-pic-base}"
++
++/* Disable C++ weak symbols for Miosix processes */
++/* When weak symbols are enabled, not all of them are resolved at link time. The
++   following cases were observed:
++   1. For a simple hello world program using cout, a R_ARM_ABS32 relocations
++      were emitted for some locale functions in the stdlib, which the Miosix
++      loader does not support. The process would fail to spawn with an
++      "Unsupported relocation" error.
++   2. For a trivial program purposefully calling a pure virtual function, an
++      incomplete PLT was generated in the binary. The PLT ends up in the
++      flash (RomFS) so it can't be written, but even if it could, Miosix 
++      doesn't support PLTs for processes. Therefore the code would jump into the
++      incomplete PLT, exexcute random instructions and crash the process.
++	Disabling weak symbols makes the linker resolve them at link time and only
++	emit R_ARM_RELATIVE relocations, which are supported by Miosix. */
++#undef  CC1PLUS_SPEC
++#define CC1PLUS_SPEC "%{!qkernelspace:-fno-weak}"
 +
 +/* No crti.o/crtbegin.o/crt0.o */
 +#undef  STARTFILE_SPEC
