@@ -543,7 +543,7 @@ index 000000000..ddb32efc5
 +			mthumb/march.$(ARCH)/mfloat-abi.soft/fno-exceptions=mthumb/march.$(ARCH)/fno-exceptions)
 diff --git a/gcc/config/miosix.h b/gcc/config/miosix.h
 new file mode 100644
-index 000000000..901370e60
+index 000000000..97d0b32b5
 --- /dev/null
 +++ b/gcc/config/miosix.h
 @@ -0,0 +1,118 @@
@@ -562,7 +562,7 @@ index 000000000..901370e60
 +      TARGET_BPABI_CPP_BUILTINS ();                 \
 +      builtin_define ("_MIOSIX");                   \
 +      builtin_define ("_MIOSIX_GCC_PATCH_MAJOR=4"); \
-+      builtin_define ("_MIOSIX_GCC_PATCH_MINOR=2"); \
++      builtin_define ("_MIOSIX_GCC_PATCH_MINOR=3"); \
 +      builtin_assert ("system=miosix");             \
 +    }                                               \
 +  while (0)
@@ -720,6 +720,36 @@ index abf5e4f4e..11fb57925 100644
    single | tpf | vxworks | win32 | mcf)
      target_thread_file=${enable_threads}
      ;;
+diff --git a/gcc/cp/decl.cc b/gcc/cp/decl.cc
+index 095cef2f2..276aafc00 100644
+--- a/gcc/cp/decl.cc
++++ b/gcc/cp/decl.cc
+@@ -5775,9 +5775,22 @@ cxx_init_decl_processing (void)
+   abort_fndecl
+     = build_library_fn_ptr ("__cxa_pure_virtual", void_ftype,
+ 			    ECF_NORETURN | ECF_NOTHROW | ECF_COLD);
+-  if (flag_weak)
+-    /* If no definition is available, resolve references to NULL.  */
+-    declare_weak (abort_fndecl);
++
++  /* Disable declaring __cxa_pure_virtual as weak for Miosix */
++  /* When weak symbols are enabled, not all of them are resolved at link time. The
++     following cases were observed:
++     1. For a simple hello world program using cout, a R_ARM_ABS32 relocations
++        were emitted for some locale functions in the stdlib, which the Miosix
++        loader does not support. The process would fail to spawn with an
++        "Unsupported relocation" error.
++     2. For a trivial program purposefully calling a pure virtual function, an
++        incomplete PLT was generated in the binary. The PLT ends up in the
++        flash (RomFS) so it can't be written, but even if it could, Miosix 
++        doesn't support PLTs for processes. Therefore the code would jump into the
++        incomplete PLT, exexcute random instructions and crash the process. */
++  //if (flag_weak)
++  ///* If no definition is available, resolve references to NULL.  */
++  //	declare_weak (abort_fndecl);
+ 
+   /* Perform other language dependent initializations.  */
+   init_class_processing ();
 diff --git a/gcc/except.cc b/gcc/except.cc
 index 98876833e..e67c2a81d 100644
 --- a/gcc/except.cc
